@@ -1,0 +1,8 @@
+fastapi 
+uvicorn 
+groq 
+gtts 
+python-multipart 
+twilio
+python-dotenv
+requests
