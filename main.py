@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from fastapi import FastAPI, Request
-from fastapi.responses import Response, FileResponse, JSONResponse
+from fastapi.responses import Response, JSONResponse
 from groq import Groq
 from twilio.rest import Client
 from tts import generate_tts, AUDIO_DIR
@@ -259,6 +259,11 @@ def _redirect_twiml(start_url: str) -> str:
     <Redirect method="POST">{start_url}</Redirect>
 </Response>"""
 
+@app.get("/")
+def server_health():
+    return {
+        "message": "Server is up and running"
+    }
 
 @app.post("/voice")
 async def voice_webhook(request: Request):
@@ -313,14 +318,20 @@ async def voice_status(request: Request):
 
 @app.get("/audio/{filename}")
 async def serve_audio(filename: str):
-    """Serve generated TTS MP3 for Twilio Play. Files live in audio_files/."""
+    """Serve TTS MP3 for Twilio Play; delete from audio_files after use."""
     if not filename.endswith(".mp3") or ".." in filename or "/" in filename:
         return Response(status_code=404)
     filepath = os.path.join(AUDIO_DIR, filename)
     if not os.path.isfile(filepath):
         log.warning("Audio file not found: %s", filepath)
         return Response(status_code=404)
-    return FileResponse(filepath, media_type="audio/mpeg")
+    with open(filepath, "rb") as f:
+        audio_bytes = f.read()
+    try:
+        os.remove(filepath)
+    except OSError as e:
+        log.warning("Could not delete audio after serve: %s", e)
+    return Response(content=audio_bytes, media_type="audio/mpeg")
 
 
 def _get_first_outbound_message() -> str:

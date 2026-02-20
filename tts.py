@@ -16,8 +16,8 @@ AUDIO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audio_file
 
 os.makedirs(AUDIO_DIR, exist_ok=True)
 
-# Preferred Indian voice: Priya (Bulbul v3) – clear, natural Indian female. Use en-IN for Indian English accent.
-DEFAULT_SPEAKER = "priya"
+# Sarvam TTS: bulbul:v3 + Ritu (Ritu is not valid for bulbul:v2; v2 speakers: anushka, abhilash, manisha, vidya, arya, karun, hitesh).
+DEFAULT_SPEAKER = "ritu"
 DEFAULT_LANGUAGE = "en-IN"
 
 
@@ -53,7 +53,7 @@ def generate_tts(
         "speaker": speaker,
         "model": "bulbul:v3",
         "output_audio_codec": "mp3",
-        "pace": 1.0,
+        "pace": 1.0,  # speed rate 1
     }
 
     if not SARVAM_API_KEY:
