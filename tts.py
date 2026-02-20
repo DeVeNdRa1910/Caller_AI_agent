@@ -16,8 +16,8 @@ AUDIO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audio_file
 
 os.makedirs(AUDIO_DIR, exist_ok=True)
 
-# Sarvam TTS: bulbul:v3 + Ritu (Ritu is not valid for bulbul:v2; v2 speakers: anushka, abhilash, manisha, vidya, arya, karun, hitesh).
-DEFAULT_SPEAKER = "ritu"
+# Sarvam TTS: bulbul:v3, voice Simran, speed rate 1 (from TTS config panel).
+DEFAULT_SPEAKER = "simran"
 DEFAULT_LANGUAGE = "en-IN"
 
 
@@ -87,6 +87,7 @@ def generate_tts(
 
     audio_bytes = base64.b64decode(audios[0])
     filename = f"{uuid.uuid4()}.mp3"
+    os.makedirs(AUDIO_DIR, exist_ok=True)
     filepath = os.path.join(AUDIO_DIR, filename)
 
     with open(filepath, "wb") as f:
