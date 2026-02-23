@@ -9,6 +9,7 @@ from fastapi.responses import Response, JSONResponse
 from groq import Groq
 from twilio.rest import Client
 from tts import generate_tts, AUDIO_DIR
+from rag import sarvam_chat
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -219,11 +220,13 @@ async def _handle_voice(form_like) -> Response:
             messages.append({"role": msg["role"], "content": msg["content"]})
         messages.append({"role": "user", "content": user_input})
 
-        completion = groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=messages,
-        )
-        ai_reply = (completion.choices[0].message.content or "").strip()
+        ai_reply = sarvam_chat(messages)
+        if not ai_reply:
+            completion = groq_client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=messages,
+            )
+            ai_reply = (completion.choices[0].message.content or "").strip()
         if not ai_reply:
             ai_reply = "I did not get a response. Please try again."
         log.info("LLM reply length=%s", len(ai_reply))
@@ -335,17 +338,22 @@ async def serve_audio(filename: str):
 
 
 def _get_first_outbound_message() -> str:
-    """Get the LLM's first message for outbound call (used in inline TwiML)."""
+    """Get the LLM's first message for outbound call (Sarvam-M free; fallback Groq)."""
     user_ctx = "[Context: You have just called the user. Introduce yourself as SONY from Sharma Logistics and say you are calling regarding their household shifting enquiry. Ask if they have a moment to talk. Keep your reply brief and under 300 words.]"
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_ctx},
+    ]
+    reply = sarvam_chat(messages)
+    if reply:
+        return reply[:3000] if len(reply) > 3000 else reply  # TwiML limit 4000 chars
+    # Fallback to Groq if Sarvam key missing or API error
     completion = groq_client.chat.completions.create(
         model="llama-3.1-8b-instant",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_ctx},
-        ],
+        messages=messages,
     )
     reply = (completion.choices[0].message.content or "").strip()
-    return reply[:3000] if len(reply) > 3000 else reply  # TwiML limit 4000 chars
+    return reply[:3000] if len(reply) > 3000 else reply
 
 
 @app.post("/call-user")
