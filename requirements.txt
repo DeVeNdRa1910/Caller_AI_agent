@@ -1,8 +1,11 @@
 fastapi 
 uvicorn 
 groq 
+twilio
 gtts 
 python-multipart 
-twilio
 python-dotenv
 requests
+
+httpx
+websockets>=12.0
