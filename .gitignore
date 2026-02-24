@@ -134,3 +134,4 @@ poetry.lock
 *.swp
 *.swo
 *~
+audio_files/

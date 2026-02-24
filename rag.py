@@ -7,15 +7,16 @@ Env: CHROMA_*, SARVAM_API_KEY (from https://dashboard.sarvam.ai).
 import logging
 import os
 import re
+import sys
 import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
 load_dotenv()
 
-import chromadb
-from chromadb.utils import embedding_functions
+# ChromaDB imported lazily via _import_chromadb() — not compatible with Python 3.14 (Pydantic v1).
 from pypdf import PdfReader
+from docx import Document as DocxDocument
 from docx import Document as DocxDocument
 
 log = logging.getLogger(__name__)
@@ -36,8 +37,25 @@ CHUNK_OVERLAP = 80
 QUERY_N_RESULTS = 10
 
 
+def _import_chromadb():
+    """Import chromadb; on Python 3.14 this can raise due to Pydantic v1 incompatibility."""
+    if sys.version_info >= (3, 14):
+        try:
+            import chromadb
+            return chromadb
+        except Exception as e:
+            raise RuntimeError(
+                "ChromaDB is not compatible with Python 3.14 (Pydantic v1). "
+                "Use Python 3.12 or 3.13 for RAG, e.g.: pyenv install 3.13 && pyenv local 3.13"
+            ) from e
+    import chromadb
+    return chromadb
+
+
 def _get_embedding_function():
     """Sentence-transformers embedding for Chroma (runs locally)."""
+    chromadb = _import_chromadb()
+    from chromadb.utils import embedding_functions
     return embedding_functions.SentenceTransformerEmbeddingFunction(
         model_name="all-MiniLM-L6-v2"
     )
@@ -48,6 +66,7 @@ def _get_client():
         raise ValueError(
             "CHROMA_API_KEY, CHROMA_TENANT, and CHROMA_DATABASE must be set in .env"
         )
+    chromadb = _import_chromadb()
     return chromadb.CloudClient(
         tenant=CHROMA_TENANT,
         database=CHROMA_DATABASE,

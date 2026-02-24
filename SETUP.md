@@ -1,5 +1,50 @@
 # Voice AI setup and troubleshooting
 
+## 0. Python version (important)
+
+**Use Python 3.12 or 3.13.** ChromaDB does not support Python 3.14 yet (Pydantic v1 compatibility issue; see [chroma-core/chroma#5996](https://github.com/chroma-core/chroma/issues/5996)). If you see:
+
+```text
+pydantic.v1.errors.ConfigError: unable to infer type for attribute "chroma_server_nofile"
+```
+
+install Python 3.13 and set up the project venv as below.
+
+### Install Python 3.13 (Ubuntu / Debian)
+
+Run in a terminal:
+
+```bash
+# Add Deadsnakes PPA (provides newer Python versions)
+sudo add-apt-repository -y ppa:deadsnakes/ppa
+sudo apt-get update
+
+# Install Python 3.13 and venv
+sudo apt-get install -y python3.13 python3.13-venv python3.13-dev
+
+# Optional: make python3.13 the default for this project only (via venv)
+python3.13 --version   # should print Python 3.13.x
+```
+
+Then in this project directory, create the virtualenv and install dependencies:
+
+```bash
+# From the project root (caller-ai-agent)
+./setup_venv.sh
+```
+
+Or manually:
+
+```bash
+python3.13 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+After that, run the app with `./serverstart.sh` (it uses `venv/`).
+
+---
+
 ## 1. Start the app and ngrok
 
 ```bash
