@@ -4,7 +4,10 @@ tts.py — Persistent WebSocket TTS + streaming LLM pipeline.
 KEY OPTIMISATION: One persistent WS connection reused across ALL turns.
 TCP+TLS handshake (~1-2s) happens ONCE at startup, not per-turn.
 
-Sarvam bulbul:v3 WS protocol:
+PIPELINE: LLM tokens stream in → sentence boundaries detected → WS chunks sent
+          → audio chunks received CONCURRENTLY → written to file as they arrive.
+
+Sarvam bulbul:v2 WS protocol:
   URL:  wss://api.sarvam.ai/text-to-speech/ws
         ?model=bulbul:v2&send_completion_event=true
   Header: Api-Subscription-Key: <key>
@@ -37,8 +40,6 @@ log = logging.getLogger(__name__)
 
 SARVAM_API_KEY = (os.getenv("SARVAM_API_KEY") or "").strip()
 TTS_REST_URL   = "https://api.sarvam.ai/text-to-speech"
-# bulbul:v2 = stable, faster render; v3-beta = higher quality but slower
-# Using v2 for lower latency on phone calls
 TTS_WS_URL     = (
     "wss://api.sarvam.ai/text-to-speech/ws"
     "?model=bulbul:v2&send_completion_event=true"
@@ -47,32 +48,31 @@ TTS_WS_URL     = (
 AUDIO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audio_files")
 os.makedirs(AUDIO_DIR, exist_ok=True)
 
-DEFAULT_SPEAKER  = "anushka"   # v2 female voice (simran is v3-only)
+DEFAULT_SPEAKER  = "anushka"
 DEFAULT_LANGUAGE = "hi-IN"
-MIN_BUFFER_SIZE  = 25    # lower = faster first audio chunk
-PING_INTERVAL    = 20    # seconds between keepalive pings
+MIN_BUFFER_SIZE  = 25
+PING_INTERVAL    = 20
 
-# Flush to TTS at sentence boundaries → low latency + natural prosody
-_SENTENCE_END = re.compile(r"[।.?!\n]+")
+# Flush to TTS at sentence boundaries — shorter = lower latency first audio
+# Added comma+space as a soft flush boundary for long Hindi sentences
+_SENTENCE_END = re.compile(r"[।.?!\n]")
+# Secondary boundary: flush on comma if buffer is getting long (avoids waiting for full sentence)
+_SOFT_FLUSH_LEN = 60   # chars — flush mid-sentence if no hard boundary yet
 
 
 def _ws_is_open(ws) -> bool:
-    """Version-agnostic open-state check (works on websockets v10-v14+)."""
     if ws is None:
         return False
-    # v14+ confirmed path (from pipecat source: websockets.protocol.State)
     try:
         from websockets.protocol import State
         return ws.state == State.OPEN
     except (ImportError, AttributeError):
         pass
-    # v10-v13
     try:
         from websockets.connection import OPEN
         return ws.state == OPEN
     except (ImportError, AttributeError):
         pass
-    # universal fallback: name string works across all versions
     try:
         return ws.state.name == "OPEN"
     except AttributeError:
@@ -89,11 +89,11 @@ class _WsConn:
     """
 
     def __init__(self, language: str, speaker: str):
-        self.language      = language
-        self.speaker       = speaker
-        self._ws           = None
-        self._lock         = asyncio.Lock()   # one synthesis at a time
-        self._ping_task    = None
+        self.language   = language
+        self.speaker    = speaker
+        self._ws        = None
+        self._lock      = asyncio.Lock()
+        self._ping_task = None
 
     # ── Public ─────────────────────────────────────────────────────────────────
 
@@ -124,7 +124,7 @@ class _WsConn:
             additional_headers=headers,
             open_timeout=10,
             close_timeout=5,
-            ping_interval=None,   # we send app-level pings manually
+            ping_interval=None,
         )
         log.info("WS connected in %.2fs", time.perf_counter() - t0)
 
@@ -133,11 +133,11 @@ class _WsConn:
             "data": {
                 "target_language_code": self.language,
                 "speaker":              self.speaker,
-                "pace":                 1.0,
-                "min_buffer_size":      MIN_BUFFER_SIZE,   # start processing at N chars
-                "max_chunk_length":     200,               # max chars per chunk
-                "output_audio_codec":   "mp3",             # explicit mp3
-                "output_audio_bitrate": "64k",             # 64k = half the data vs 128k = faster render + transfer
+                "pace":                 1.05,              # slightly faster speech = less audio time
+                "min_buffer_size":      MIN_BUFFER_SIZE,
+                "max_chunk_length":     200,
+                "output_audio_codec":   "mp3",
+                "output_audio_bitrate": "64k",
             }
         }))
         log.info("WS config sent (lang=%s speaker=%s)", self.language, self.speaker)
@@ -147,7 +147,6 @@ class _WsConn:
         self._ping_task = asyncio.create_task(self._keepalive())
 
     async def _ensure_connected(self):
-        """Reconnect if the socket is gone — version-agnostic."""
         if not _ws_is_open(self._ws):
             log.info("WS not open — reconnecting…")
             if self._ws:
@@ -171,77 +170,96 @@ class _WsConn:
                     break
 
     async def _do_synthesise(self, groq_stream) -> tuple[str, str]:
+        """
+        TRUE parallel pipeline:
+          - _send_tokens coroutine: reads LLM stream, sends to WS at sentence boundaries
+          - _recv_audio coroutine:  receives audio chunks as they arrive
+          Both run concurrently via asyncio.gather — TTS starts before LLM finishes.
+        """
         t_total      = time.perf_counter()
         audio_chunks : list[bytes] = []
         full_text    = ""
-
-        # Drain the groq stream fully first so we can retry TTS on WS failure
-        # without losing the text. For a 1-2 sentence reply this adds ~0ms.
-        # We buffer tokens as they stream, sending to WS simultaneously.
 
         for attempt in range(2):
             audio_chunks.clear()
             try:
                 await self._ensure_connected()
 
-                # --- send tokens + flush ---
+                # ── Coroutine 1: LLM tokens → WS sends ────────────────────────
                 async def _send_tokens():
                     nonlocal full_text
-                    buf          = ""
-                    first_token  = True
+                    buf         = ""
+                    first_token = True
+
                     async for chunk in groq_stream:
                         token = chunk.choices[0].delta.content or ""
                         if not token:
                             continue
                         full_text += token
                         buf       += token
+
                         if first_token:
-                            log.info("⏱  LLM first token: %.2fs", time.perf_counter() - t_total)
+                            log.info("⏱  LLM first token: %.3fs", time.perf_counter() - t_total)
                             first_token = False
-                        if _SENTENCE_END.search(buf):
+
+                        # Flush at hard sentence boundary OR soft buffer length
+                        should_flush = (
+                            _SENTENCE_END.search(buf)
+                            or len(buf) >= _SOFT_FLUSH_LEN
+                        )
+                        if should_flush and buf.strip():
                             await self._ws.send(json.dumps({
                                 "type": "text",
-                                "data": {"text": buf}
+                                "data": {"text": buf.strip()}
                             }))
-                            log.debug("WS chunk (%d chars): %s", len(buf), buf[:60])
+                            log.debug("WS chunk sent (%d chars): %s", len(buf), buf[:60])
                             buf = ""
+
+                    # Send any remaining text
                     if buf.strip():
                         await self._ws.send(json.dumps({
                             "type": "text",
-                            "data": {"text": buf}
+                            "data": {"text": buf.strip()}
                         }))
-                    await self._ws.send(json.dumps({"type": "flush"}))
-                    log.info("⏱  LLM done + flush: %.2fs", time.perf_counter() - t_total)
 
-                # --- receive audio ---
+                    # Signal TTS that we're done sending
+                    await self._ws.send(json.dumps({"type": "flush"}))
+                    log.info("⏱  LLM done + WS flush: %.3fs", time.perf_counter() - t_total)
+
+                # ── Coroutine 2: WS receives audio chunks ─────────────────────
                 async def _recv_audio():
                     t_first = None
                     async for msg in self._ws:
                         data     = json.loads(msg)
                         msg_type = data.get("type")
+
                         if msg_type == "audio":
                             b64 = (data.get("data") or {}).get("audio") or ""
                             if b64:
                                 if t_first is None:
                                     t_first = time.perf_counter()
-                                    log.info("⏱  TTS first audio: %.2fs", t_first - t_total)
+                                    log.info("⏱  TTS first audio chunk: %.3fs", t_first - t_total)
                                 audio_chunks.append(base64.b64decode(b64))
+
                         elif msg_type == "event":
-                            log.info("⏱  TTS complete: %.2fs", time.perf_counter() - t_total)
-                            break
+                            log.info("⏱  TTS complete event: %.3fs", time.perf_counter() - t_total)
+                            break   # <-- exits the loop, allowing gather to finish
+
                         elif msg_type == "error":
                             raise RuntimeError(f"Sarvam WS error: {data}")
+
                         elif msg_type == "pong":
                             log.debug("WS pong received")
 
+                # Run both concurrently — _recv_audio exits when it sees "event"
+                # _send_tokens feeds in LLM tokens as they arrive
                 await asyncio.gather(_send_tokens(), _recv_audio())
-                break   # success — exit retry loop
+                break   # success
 
             except (ConnectionClosed, WebSocketException, OSError, RuntimeError) as e:
                 log.warning("WS attempt %d failed: %s", attempt + 1, e)
                 self._ws = None
                 if attempt == 1:
-                    # Both attempts failed → REST fallback using buffered text
                     log.warning("WS failed twice → REST fallback")
                     if full_text.strip():
                         fname = await generate_tts_async(full_text.strip(), self.language, self.speaker)
@@ -255,11 +273,12 @@ class _WsConn:
             fname = await generate_tts_async(full_text, self.language, self.speaker)
             return fname, full_text
 
-        combined = b"".join(audio_chunks)
+        combined  = b"".join(audio_chunks)
         filename  = f"{uuid.uuid4()}.mp3"
-        with open(os.path.join(AUDIO_DIR, filename), "wb") as f:
+        filepath  = os.path.join(AUDIO_DIR, filename)
+        with open(filepath, "wb") as f:
             f.write(combined)
-        log.info("⏱  TOTAL: %.2fs | %d bytes | %s",
+        log.info("⏱  TOTAL pipeline: %.3fs | %d bytes | text: %s",
                  time.perf_counter() - t_total, len(combined), full_text[:80])
         return filename, full_text
 
@@ -310,7 +329,7 @@ async def close_all_ws():
         _pool.clear()
 
 
-# ── REST client ────────────────────────────────────────────────────────────────
+# ── REST client (fallback + one-shot audio) ────────────────────────────────────
 
 _http_client: httpx.AsyncClient | None = None
 
@@ -346,12 +365,12 @@ async def generate_tts_async(
     speaker:  str | None = None,
     model:    str | None = None,
 ) -> str:
-    """REST TTS — for static one-shot text. Returns filename."""
+    """REST TTS — for static one-shot text (opening message). Returns filename."""
     if not SARVAM_API_KEY:
         raise ValueError("SARVAM_API_KEY not set")
     language = language or ("hi-IN" if _is_mostly_hindi(text) else DEFAULT_LANGUAGE)
     speaker  = speaker  or DEFAULT_SPEAKER
-    model    = model    or "bulbul:v2"   # v2 = faster render for phone calls
+    model    = model    or "bulbul:v2"
 
     payload = {
         "text":                 text,
@@ -359,7 +378,7 @@ async def generate_tts_async(
         "speaker":              speaker,
         "model":                model,
         "output_audio_codec":   "mp3",
-        "pace":                 1.0,
+        "pace":                 1.05,
     }
     headers = {
         "api-subscription-key": SARVAM_API_KEY,
