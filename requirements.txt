@@ -6,6 +6,6 @@ gtts
 python-multipart 
 python-dotenv
 requests
-
+sarvamai
 httpx
 websockets>=12.0
