@@ -1,27 +1,27 @@
 """
-tts.py — Persistent WebSocket TTS + streaming LLM pipeline.
+tts.py — Persistent WebSocket TTS with keepalive pings.
 
-KEY FIX: The WS 422 error was caused by unsupported fields in the config payload
-(output_audio_bitrate, max_chunk_length). Stripped to only fields Sarvam accepts.
-
-KEY FIX 2: Sarvam WS closes the connection after each flush/completion event.
-We now detect this and reconnect, but skip the double-reconnect waste by
-going straight to REST if WS fails, while also running LLM in parallel.
+KEY CHANGE: Sarvam WS supports a "ping" message type to keep the connection
+alive (1-minute idle timeout). We now maintain ONE persistent connection per
+language/speaker pair across ALL turns, eliminating the ~300ms reconnect cost
+on every turn.
 
 ARCHITECTURE:
-  - LLM streams tokens into a queue
-  - TTS WS (or REST fallback) drains the queue
-  - Both run concurrently via asyncio.gather
+  - _PersistentWsConn keeps one WS open indefinitely with a background keepalive task
+  - Per turn: send config (once, first time) → send text chunks → flush → recv audio
+  - Since connection is already open, per-turn overhead is near-zero
+  - REST fallback if WS fails, with instant retry on next turn
 
 Sarvam bulbul:v3 WS protocol:
   URL:  wss://api.sarvam.ai/text-to-speech/ws
         ?model=bulbul:v3&send_completion_event=true
   Header: Api-Subscription-Key: <key>
-  1. config  → {"type":"config","data":{"target_language_code","speaker","pace"}}
-  2. text    → {"type":"text","data":{"text":"…"}}
-  3. flush   → {"type":"flush"}
-  ← audio   ← {"type":"audio","data":{"audio":"<b64 mp3>"}}
-  ← event   ← {"type":"event",...}  ← connection closes after this
+  1. config    → {"type":"config","data":{"target_language_code","speaker","pace"}}
+  2. text      → {"type":"text","data":{"text":"…"}}
+  3. flush     → {"type":"flush"}
+  4. ping      → {"type":"ping"}  ← keepalive, send every 30s of idle
+  ← audio     ← {"type":"audio","data":{"audio":"<b64 mp3>"}}
+  ← event     ← {"type":"event",...}  ← signals TTS done, connection stays open
 """
 
 import asyncio
@@ -45,10 +45,9 @@ log = logging.getLogger(__name__)
 SARVAM_API_KEY = (os.getenv("SARVAM_API_KEY") or "").strip()
 TTS_REST_URL   = "https://api.sarvam.ai/text-to-speech"
 
-# v3 model + simran speaker as requested
-TTS_MODEL      = "bulbul:v3"
-TTS_SPEAKER    = "simran"
-TTS_WS_URL     = f"wss://api.sarvam.ai/text-to-speech/ws?model={TTS_MODEL}&send_completion_event=true"
+TTS_MODEL   = "bulbul:v3"
+TTS_SPEAKER = "simran"
+TTS_WS_URL  = f"wss://api.sarvam.ai/text-to-speech/ws?model={TTS_MODEL}&send_completion_event=true"
 
 AUDIO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audio_files")
 os.makedirs(AUDIO_DIR, exist_ok=True)
@@ -56,9 +55,9 @@ os.makedirs(AUDIO_DIR, exist_ok=True)
 DEFAULT_SPEAKER  = TTS_SPEAKER
 DEFAULT_LANGUAGE = "hi-IN"
 
-# Flush to TTS at sentence boundaries OR when buffer gets long
-_SENTENCE_END  = re.compile(r"[।.?!\n]")
-_SOFT_FLUSH_LEN = 50   # chars — flush mid-sentence to start TTS early
+_SENTENCE_END   = re.compile(r"[।.?!\n]")
+_SOFT_FLUSH_LEN = 50   # chars: flush mid-sentence to start TTS early
+_PING_INTERVAL  = 30   # seconds between keepalive pings
 
 
 def _ws_is_open(ws) -> bool:
@@ -83,39 +82,70 @@ def _ws_is_open(ws) -> bool:
 
 # ── Persistent WS connection ───────────────────────────────────────────────────
 
-class _WsConn:
+class _PersistentWsConn:
     """
-    Persistent Sarvam WS connection.
+    Single long-lived Sarvam WS connection with keepalive pings.
 
-    NOTE: Sarvam closes the WS after each flush+event cycle. So "persistent"
-    means we reconnect once per turn (not per retry). The key saving vs the
-    original code is:
-      - We connect ONCE per turn (not twice on failure)
-      - We don't waste time on two failed WS attempts before REST
-      - LLM tokens are buffered so REST fallback can use them instantly
+    Lifecycle:
+      - connect() once (done at startup by warmup_ws)
+      - keepalive task sends {"type":"ping"} every 30s to prevent idle disconnect
+      - synthesise() sends text+flush, receives audio, connection stays open
+      - If connection dies mid-turn → REST fallback, reconnect on next call
     """
 
     def __init__(self, language: str, speaker: str):
-        self.language = language
-        self.speaker  = speaker
-        self._ws      = None
-        self._lock    = asyncio.Lock()
+        self.language       = language
+        self.speaker        = speaker
+        self._ws            = None
+        self._lock          = asyncio.Lock()
+        self._keepalive_task: asyncio.Task | None = None
+        self._config_sent   = False
 
-    async def synthesise(self, groq_stream) -> tuple[str, str]:
+    # ── Public ──────────────────────────────────────────────────────────────
+
+    async def connect(self) -> bool:
+        """Establish WS and start keepalive. Safe to call multiple times."""
+        if _ws_is_open(self._ws):
+            return True
+        return await self._connect()
+
+    async def synthesise(self, text: str) -> tuple[str, str]:
+        """
+        Synthesise a pre-known text string (no LLM stream).
+        Returns (filename, text).
+        """
+        async with asyncio.timeout(20):
+            async with self._lock:
+                return await self._do_synthesise_text(text)
+
+    async def synthesise_stream(self, groq_stream) -> tuple[str, str]:
+        """
+        Synthesise from a live LLM stream (concurrent LLM drain + WS send).
+        Returns (filename, full_text).
+        """
         async with asyncio.timeout(25):
             async with self._lock:
-                return await self._do_synthesise(groq_stream)
+                return await self._do_synthesise_stream(groq_stream)
 
     async def close(self):
+        if self._keepalive_task:
+            self._keepalive_task.cancel()
+            try:
+                await self._keepalive_task
+            except asyncio.CancelledError:
+                pass
+            self._keepalive_task = None
         if self._ws:
             try:
                 await self._ws.close()
             except Exception:
                 pass
             self._ws = None
+        self._config_sent = False
+
+    # ── Internal ─────────────────────────────────────────────────────────────
 
     async def _connect(self) -> bool:
-        """Connect and send config. Returns True on success."""
         t0 = time.perf_counter()
         try:
             headers  = {"Api-Subscription-Key": SARVAM_API_KEY}
@@ -124,36 +154,113 @@ class _WsConn:
                 additional_headers=headers,
                 open_timeout=8,
                 close_timeout=3,
-                ping_interval=None,
+                ping_interval=None,   # we handle pings manually
             )
             log.info("WS connected in %.3fs", time.perf_counter() - t0)
+            self._config_sent = False
 
-            # MINIMAL config — only fields Sarvam v3 WS actually accepts
-            # DO NOT add output_audio_bitrate or max_chunk_length — causes 422
-            await self._ws.send(json.dumps({
-                "type": "config",
-                "data": {
-                    "target_language_code": self.language,
-                    "speaker":              self.speaker,
-                    "pace":                 1.1,
-                }
-            }))
-            log.info("WS config sent (lang=%s speaker=%s)", self.language, self.speaker)
+            # Send config immediately after connect
+            await self._send_config()
+
+            # Start keepalive in background
+            if self._keepalive_task is None or self._keepalive_task.done():
+                self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+
             return True
         except Exception as e:
             log.warning("WS connect failed: %s", e)
-            self._ws = None
+            self._ws            = None
+            self._config_sent   = False
             return False
 
-    async def _do_synthesise(self, groq_stream) -> tuple[str, str]:
+    async def _send_config(self):
+        """Send config frame (once per connection)."""
+        if not _ws_is_open(self._ws):
+            return
+        await self._ws.send(json.dumps({
+            "type": "config",
+            "data": {
+                "target_language_code": self.language,
+                "speaker":              self.speaker,
+                "pace":                 1.1,
+            }
+        }))
+        self._config_sent = True
+        log.info("WS config sent (lang=%s speaker=%s)", self.language, self.speaker)
+
+    async def _keepalive_loop(self):
+        """Send ping every _PING_INTERVAL seconds to prevent idle disconnect."""
+        try:
+            while True:
+                await asyncio.sleep(_PING_INTERVAL)
+                if not _ws_is_open(self._ws):
+                    log.info("Keepalive: WS closed, stopping ping task")
+                    return
+                try:
+                    await self._ws.send(json.dumps({"type": "ping"}))
+                    log.debug("Keepalive ping sent")
+                except Exception as e:
+                    log.warning("Keepalive ping failed: %s — will reconnect on next turn", e)
+                    self._ws          = None
+                    self._config_sent = False
+                    return
+        except asyncio.CancelledError:
+            pass
+
+    async def _ensure_ws(self) -> bool:
+        """Reconnect if needed before a turn. Returns True if WS is ready."""
+        if _ws_is_open(self._ws) and self._config_sent:
+            return True
+        log.info("WS not ready — reconnecting…")
+        return await self._connect()
+
+    async def _do_synthesise_text(self, text: str) -> tuple[str, str]:
+        """Synthesise from a plain string (cache pre-render path)."""
+        t0 = time.perf_counter()
+        ws_ok = await self._ensure_ws()
+        if not ws_ok:
+            log.info("WS unavailable — REST fallback for text synth")
+            fname = await generate_tts_async(text, self.language, self.speaker)
+            return fname, text
+
+        try:
+            audio_chunks: list[bytes] = []
+            await self._ws.send(json.dumps({"type": "text", "data": {"text": text.strip()}}))
+            await self._ws.send(json.dumps({"type": "flush"}))
+            log.info("⏱  WS flush (text): %.3fs", time.perf_counter() - t0)
+
+            async for msg in self._ws:
+                data     = json.loads(msg)
+                msg_type = data.get("type")
+                if msg_type == "audio":
+                    b64 = (data.get("data") or {}).get("audio") or ""
+                    if b64:
+                        audio_chunks.append(base64.b64decode(b64))
+                elif msg_type == "event":
+                    log.info("⏱  TTS complete (text): %.3fs", time.perf_counter() - t0)
+                    break
+                elif msg_type == "error":
+                    raise RuntimeError(f"Sarvam WS error: {data}")
+
+            if audio_chunks:
+                return _save_audio(audio_chunks, text, t0)
+            log.warning("WS: no audio chunks — REST fallback")
+
+        except (ConnectionClosed, WebSocketException, OSError, RuntimeError) as e:
+            log.warning("WS error during text synth: %s — REST fallback", e)
+            self._ws          = None
+            self._config_sent = False
+
+        fname = await generate_tts_async(text, self.language, self.speaker)
+        return fname, text
+
+    async def _do_synthesise_stream(self, groq_stream) -> tuple[str, str]:
+        """Synthesise from live LLM stream: LLM drain + WS send run concurrently."""
         t_total      = time.perf_counter()
         audio_chunks : list[bytes] = []
         full_text    = ""
         llm_buffer   : list[str]   = []
         llm_done_evt = asyncio.Event()
-
-        # PARALLEL: WS connect (~300ms) + LLM drain run simultaneously.
-        # By the time first tokens arrive, WS is already ready => ~300ms saved.
 
         async def _drain_llm():
             nonlocal full_text
@@ -170,10 +277,12 @@ class _WsConn:
             log.info("⏱  LLM done: %.3fs | %s", time.perf_counter() - t_total, full_text[:60])
             llm_done_evt.set()
 
-        llm_task     = asyncio.create_task(_drain_llm())
-        connect_task = asyncio.create_task(self._connect())
-        ws_ok        = await connect_task
-        log.info("⏱  WS ready: %.3fs (ok=%s)", time.perf_counter() - t_total, ws_ok)
+        llm_task = asyncio.create_task(_drain_llm())
+
+        # Check WS health — fast if already connected (~0ms), slow if need reconnect (~300ms)
+        # Both run somewhat concurrently: LLM draining while we check/reconnect WS
+        ws_ok = await self._ensure_ws()
+        log.info("⏱  WS ready check: %.3fs (ok=%s)", time.perf_counter() - t_total, ws_ok)
 
         if ws_ok:
             try:
@@ -213,7 +322,6 @@ class _WsConn:
                             raise RuntimeError(f"Sarvam WS error: {data}")
 
                 await asyncio.gather(llm_task, _send_from_buffer(), _recv_audio())
-                self._ws  = None
                 full_text = full_text.strip() or "कृपया दोबारा बोलें।"
                 if audio_chunks:
                     return _save_audio(audio_chunks, full_text, t_total)
@@ -221,15 +329,16 @@ class _WsConn:
 
             except (ConnectionClosed, WebSocketException, OSError, RuntimeError) as e:
                 log.warning("WS error: %s — REST fallback", e)
-                self._ws = None
+                self._ws          = None
+                self._config_sent = False
 
-        # REST fallback — LLM already draining in background
+        # REST fallback
         if not llm_task.done():
             await llm_task
         full_text = full_text.strip() or "कृपया दोबारा बोलें।"
         log.info("⏱  REST text ready: %.3fs", time.perf_counter() - t_total)
         fname = await generate_tts_async(full_text, self.language, self.speaker)
-        log.info("⏱  TOTAL (REST): %.3fs", time.perf_counter() - t_total)
+        log.info("⏱  TOTAL (REST fallback): %.3fs", time.perf_counter() - t_total)
         return fname, full_text
 
 
@@ -245,36 +354,37 @@ def _save_audio(chunks: list[bytes], full_text: str, t0: float) -> tuple[str, st
 
 # ── Connection pool ────────────────────────────────────────────────────────────
 
-_pool      : dict[tuple[str, str], _WsConn] = {}
+_pool      : dict[tuple[str, str], _PersistentWsConn] = {}
 _pool_lock = asyncio.Lock()
 
 
-async def _get_conn(language: str, speaker: str) -> _WsConn:
+async def _get_conn(language: str, speaker: str) -> _PersistentWsConn:
     key = (language, speaker)
     async with _pool_lock:
         if key not in _pool:
-            _pool[key] = _WsConn(language, speaker)
+            _pool[key] = _PersistentWsConn(language, speaker)
         return _pool[key]
 
 
 async def warmup_ws(language: str = DEFAULT_LANGUAGE, speaker: str = DEFAULT_SPEAKER):
     """
-    Warm-up: just validate credentials by doing a test WS connect.
-    Sarvam closes WS after each turn so we can't keep one open forever.
-    The real per-turn connect cost is ~250-400ms — unavoidable with Sarvam.
+    Warm up: establish the persistent WS connection at startup.
+    After this returns, all turns get near-zero WS connect overhead.
     """
-    log.info("Warming up WS TTS (%s / %s)…", language, speaker)
+    log.info("Warming up persistent WS TTS (%s / %s)…", language, speaker)
     conn = await _get_conn(language, speaker)
-    ok   = await conn._connect()
+    ok   = await conn.connect()
     if ok:
-        try:
-            await conn._ws.close()
-        except Exception:
-            pass
-        conn._ws = None
-        log.info("WS TTS warm-up done — credentials valid.")
+        log.info("✅ Persistent WS TTS ready — keepalive active.")
     else:
-        log.warning("WS warm-up failed — will use REST TTS.")
+        log.warning("⚠️  WS warm-up failed — will use REST TTS until reconnect.")
+
+
+async def close_all_ws():
+    async with _pool_lock:
+        for conn in _pool.values():
+            await conn.close()
+        _pool.clear()
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
@@ -289,17 +399,35 @@ async def llm_to_tts_stream(
     language = language or DEFAULT_LANGUAGE
     speaker  = speaker  or DEFAULT_SPEAKER
     conn     = await _get_conn(language, speaker)
-    return await conn.synthesise(groq_stream)
+    return await conn.synthesise_stream(groq_stream)
 
 
-async def close_all_ws():
-    async with _pool_lock:
-        for conn in _pool.values():
-            await conn.close()
-        _pool.clear()
+async def synthesise_text(
+    text: str,
+    language: str | None = None,
+    speaker:  str | None = None,
+) -> str:
+    """
+    Synthesise known text via persistent WS (fastest path: no LLM needed).
+    Used by the pre-render cache. Returns filename.
+    """
+    if not SARVAM_API_KEY:
+        raise ValueError("SARVAM_API_KEY not set")
+    language = language or DEFAULT_LANGUAGE
+    speaker  = speaker  or DEFAULT_SPEAKER
+    conn     = await _get_conn(language, speaker)
+    filename, _ = await conn.synthesise(text)
+    return filename
 
 
-# ── REST client ────────────────────────────────────────────────────────────────
+async def close_http_client():
+    global _http_client
+    if _http_client and not _http_client.is_closed:
+        await _http_client.aclose()
+    await close_all_ws()
+
+
+# ── REST client (fallback) ─────────────────────────────────────────────────────
 
 _http_client: httpx.AsyncClient | None = None
 
@@ -312,13 +440,6 @@ def _get_http_client() -> httpx.AsyncClient:
             timeout=httpx.Timeout(15.0),
         )
     return _http_client
-
-
-async def close_http_client():
-    global _http_client
-    if _http_client and not _http_client.is_closed:
-        await _http_client.aclose()
-    await close_all_ws()
 
 
 def _is_mostly_hindi(text: str) -> bool:
