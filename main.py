@@ -326,16 +326,17 @@ async def startup():
     # Step 1: Connect persistent WS (blocking until done so pre-render can use it)
     await warmup_ws()
 
-    # Step 2: Pre-render opening + all fixed responses
-    # Opening can run in parallel with fixed responses since they're independent
-    opening_task   = asyncio.create_task(synthesise_text(OUTBOUND_OPENING))
-    prerender_task = asyncio.create_task(_prerender_all())
-
-    _opening_audio = await opening_task
+    # Step 2: Pre-render opening (block so /call-user has it). Fixed responses run in background.
+    _opening_audio = await synthesise_text(OUTBOUND_OPENING)
     log.info("✅ Opening audio ready: %s", _opening_audio)
 
-    await prerender_task
-    log.info("✅ Startup done. Cache: %d/%d entries", len(_audio_cache), len(FIXED_RESPONSES))
+    # Step 3: Pre-render fixed responses in background so server can accept requests immediately
+    async def _startup_prerender():
+        await _prerender_all()
+        log.info("✅ Startup cache warm. Cache: %d/%d entries", len(_audio_cache), len(FIXED_RESPONSES))
+
+    asyncio.create_task(_startup_prerender())
+    log.info("✅ Startup done — server ready (cache warming in background).")
 
 
 @app.on_event("shutdown")
