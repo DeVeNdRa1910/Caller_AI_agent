@@ -182,7 +182,7 @@ class _PersistentWsConn:
             "data": {
                 "target_language_code": self.language,
                 "speaker":              self.speaker,
-                "pace":                 1.1,
+                "pace":                 1.0,
             }
         }))
         self._config_sent = True
@@ -468,7 +468,7 @@ async def generate_tts_async(
         "target_language_code": language,
         "speaker":              speaker,
         "model":                model,
-        "pace":                 1.1,
+        "pace":                 1.0,
         "output_audio_codec":   "mp3",
     }
     headers = {
