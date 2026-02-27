@@ -32,6 +32,7 @@ import os
 import re
 import time
 import uuid
+from collections import OrderedDict
 
 import httpx
 import websockets
@@ -56,8 +57,12 @@ DEFAULT_SPEAKER  = TTS_SPEAKER
 DEFAULT_LANGUAGE = "hi-IN"
 
 _SENTENCE_END   = re.compile(r"[।.?!\n]")
-_SOFT_FLUSH_LEN = 50   # chars: flush mid-sentence to start TTS early
+_SOFT_FLUSH_LEN = 15   # chars: flush very early so TTS starts sooner
 _PING_INTERVAL  = 30   # seconds between keepalive pings
+
+# In-memory TTS response cache (arbitrary text → audio bytes). Repeat replies skip API.
+_TTS_RESPONSE_CACHE_MAX = 50
+_tts_response_cache: OrderedDict[str, bytes] = OrderedDict()
 
 
 def _ws_is_open(ws) -> bool:
@@ -279,8 +284,6 @@ class _PersistentWsConn:
 
         llm_task = asyncio.create_task(_drain_llm())
 
-        # Check WS health — fast if already connected (~0ms), slow if need reconnect (~300ms)
-        # Both run somewhat concurrently: LLM draining while we check/reconnect WS
         ws_ok = await self._ensure_ws()
         log.info("⏱  WS ready check: %.3fs (ok=%s)", time.perf_counter() - t_total, ws_ok)
 
@@ -297,7 +300,7 @@ class _PersistentWsConn:
                             buf = ""
                         if llm_done_evt.is_set() and not llm_buffer:
                             break
-                        await asyncio.sleep(0.005)
+                        await asyncio.sleep(0.001)
                     if buf.strip():
                         await self._ws.send(json.dumps({"type": "text", "data": {"text": buf.strip()}}))
                     await self._ws.send(json.dumps({"type": "flush"}))
@@ -332,7 +335,6 @@ class _PersistentWsConn:
                 self._ws          = None
                 self._config_sent = False
 
-        # REST fallback
         if not llm_task.done():
             await llm_task
         full_text = full_text.strip() or "कृपया दोबारा बोलें।"
@@ -340,6 +342,39 @@ class _PersistentWsConn:
         fname = await generate_tts_async(full_text, self.language, self.speaker)
         log.info("⏱  TOTAL (REST fallback): %.3fs", time.perf_counter() - t_total)
         return fname, full_text
+
+    async def synthesise_to_bytes(self, text: str) -> bytes | None:
+        """
+        Synthesise text and return raw audio bytes (no file write).
+        Used by media stream for in-memory path → ~2–3s response (reference repo pattern).
+        Returns None on failure or REST fallback (caller may fall back to file path).
+        """
+        t0 = time.perf_counter()
+        ws_ok = await self._ensure_ws()
+        if not ws_ok:
+            return None
+        try:
+            audio_chunks: list[bytes] = []
+            await self._ws.send(json.dumps({"type": "text", "data": {"text": text.strip()}}))
+            await self._ws.send(json.dumps({"type": "flush"}))
+            log.info("⏱  WS flush (bytes): %.3fs", time.perf_counter() - t0)
+            async for msg in self._ws:
+                data = json.loads(msg)
+                msg_type = data.get("type")
+                if msg_type == "audio":
+                    b64 = (data.get("data") or {}).get("audio") or ""
+                    if b64:
+                        audio_chunks.append(base64.b64decode(b64))
+                elif msg_type == "event":
+                    break
+                elif msg_type == "error":
+                    raise RuntimeError(f"Sarvam WS error: {data}")
+            if audio_chunks:
+                return b"".join(audio_chunks)
+        except (ConnectionClosed, WebSocketException, OSError, RuntimeError):
+            self._ws = None
+            self._config_sent = False
+        return None
 
 
 def _save_audio(chunks: list[bytes], full_text: str, t0: float) -> tuple[str, str]:
@@ -408,16 +443,85 @@ async def synthesise_text(
     speaker:  str | None = None,
 ) -> str:
     """
-    Synthesise known text via persistent WS (fastest path: no LLM needed).
-    Used by the pre-render cache. Returns filename.
+    Synthesise known text via persistent WS (or REST fallback).
+    Uses in-memory response cache: repeated same text returns instantly (no API call).
+    Returns filename.
     """
     if not SARVAM_API_KEY:
         raise ValueError("SARVAM_API_KEY not set")
+    key = text.strip()
+    if not key:
+        key = " "
+    # Cache hit: write cached bytes to a new file and return (reference-repo style)
+    if key in _tts_response_cache:
+        audio_bytes = _tts_response_cache[key]
+        _tts_response_cache.move_to_end(key)
+        filename = f"{uuid.uuid4()}.mp3"
+        with open(os.path.join(AUDIO_DIR, filename), "wb") as f:
+            f.write(audio_bytes)
+        log.debug("TTS cache hit: %s", key[:40])
+        return filename
+
     language = language or DEFAULT_LANGUAGE
     speaker  = speaker  or DEFAULT_SPEAKER
     conn     = await _get_conn(language, speaker)
     filename, _ = await conn.synthesise(text)
+    # Store in cache for next time (evict oldest if over limit)
+    try:
+        with open(os.path.join(AUDIO_DIR, filename), "rb") as f:
+            audio_bytes = f.read()
+        _tts_response_cache[key] = audio_bytes
+        _tts_response_cache.move_to_end(key)
+        while len(_tts_response_cache) > _TTS_RESPONSE_CACHE_MAX:
+            _tts_response_cache.popitem(last=False)
+    except OSError:
+        pass
     return filename
+
+
+async def synthesise_text_bytes(
+    text: str,
+    language: str | None = None,
+    speaker:  str | None = None,
+) -> bytes | None:
+    """
+    Synthesise text and return raw audio bytes (no file I/O).
+    Used by media stream for 2–3s response: in-memory path, no disk write/read.
+    Uses cache; on miss uses WS and returns bytes (or REST fallback reads file once).
+    """
+    if not SARVAM_API_KEY:
+        return None
+    key = text.strip() or " "
+    if key in _tts_response_cache:
+        _tts_response_cache.move_to_end(key)
+        return _tts_response_cache[key]
+    language = language or DEFAULT_LANGUAGE
+    speaker = speaker or DEFAULT_SPEAKER
+    conn = await _get_conn(language, speaker)
+    audio_bytes = await conn.synthesise_to_bytes(text)
+    if audio_bytes:
+        _tts_response_cache[key] = audio_bytes
+        _tts_response_cache.move_to_end(key)
+        while len(_tts_response_cache) > _TTS_RESPONSE_CACHE_MAX:
+            _tts_response_cache.popitem(last=False)
+        return audio_bytes
+    # REST fallback: generate to file then read once
+    try:
+        fname = await generate_tts_async(text, language, speaker)
+        path = os.path.join(AUDIO_DIR, fname)
+        with open(path, "rb") as f:
+            data = f.read()
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        _tts_response_cache[key] = data
+        _tts_response_cache.move_to_end(key)
+        while len(_tts_response_cache) > _TTS_RESPONSE_CACHE_MAX:
+            _tts_response_cache.popitem(last=False)
+        return data
+    except Exception:
+        return None
 
 
 async def close_http_client():
@@ -456,9 +560,19 @@ async def generate_tts_async(
     speaker:  str | None = None,
     model:    str | None = None,
 ) -> str:
-    """REST TTS — reliable fallback. Returns filename."""
+    """REST TTS — reliable fallback. Uses response cache for repeated text. Returns filename."""
     if not SARVAM_API_KEY:
         raise ValueError("SARVAM_API_KEY not set")
+    key = text.strip() or " "
+    if key in _tts_response_cache:
+        audio_bytes = _tts_response_cache[key]
+        _tts_response_cache.move_to_end(key)
+        filename = f"{uuid.uuid4()}.mp3"
+        with open(os.path.join(AUDIO_DIR, filename), "wb") as f:
+            f.write(audio_bytes)
+        log.debug("REST TTS cache hit: %s", key[:40])
+        return filename
+
     language = language or ("hi-IN" if _is_mostly_hindi(text) else DEFAULT_LANGUAGE)
     speaker  = speaker  or DEFAULT_SPEAKER
     model    = model    or TTS_MODEL
@@ -490,7 +604,12 @@ async def generate_tts_async(
         raise ValueError("Sarvam REST TTS returned no audio")
 
     audio_bytes = base64.b64decode(audios[0])
-    filename    = f"{uuid.uuid4()}.mp3"
+    _tts_response_cache[key] = audio_bytes
+    _tts_response_cache.move_to_end(key)
+    while len(_tts_response_cache) > _TTS_RESPONSE_CACHE_MAX:
+        _tts_response_cache.popitem(last=False)
+
+    filename = f"{uuid.uuid4()}.mp3"
     with open(os.path.join(AUDIO_DIR, filename), "wb") as f:
         f.write(audio_bytes)
     log.info("REST TTS done in %.3fs: %s (%d bytes)",

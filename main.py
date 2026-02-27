@@ -2,32 +2,28 @@
 main.py — Ultra-low-latency voice pipeline for Sharma Logistics SONY bot.
 
 LATENCY STRATEGY:
-  Pipeline (LLM+TTS): ~1.0-1.5s  ← improved by persistent WS (no reconnect)
-  Twilio overhead:    ~2-3s       ← speechTimeout(1s) + fetch + play start
-  Total perceived:    ~3-4s target ✅
+  Gather path: speechTimeout 0.8s + LLM stream + TTS overlap + TTS cache.
+  Media Streams path: /voice-stream → WebSocket → VAD → STT → LLM → progressive TTS (~2s to first audio).
 
-KEY OPTIMIZATIONS:
-  1. PERSISTENT WS: One WS connection stays alive for all turns via ping keepalive.
-     Old code: ~300ms WS connect cost on every single turn.
-     New code: ~0ms WS cost on turns 2+ (connection already open).
-
-  2. PRE-RENDER CACHE: All 7 fixed questions rendered at startup via persistent WS.
-     On cache hit: 0ms LLM + 0ms TTS = ~200ms total (just Twilio overhead).
-     On cache miss: LLM (~200ms first token) + WS TTS (~400ms) = ~600ms.
-
-  3. PARALLEL LLM + WS: LLM streams tokens while WS is being checked (not reconnected).
-     Since WS is persistent, check is instant and first token goes to TTS immediately.
+OPTIMIZATIONS (from call-customer-support-system and local):
+  1. speechTimeout="0.8" — faster end-of-speech (Gather).
+  2. LLM+TTS OVERLAP: llm_to_tts_stream(stream) so first tokens go to TTS while LLM streams.
+  3. TTS response cache (arbitrary text) in tts.py — repeat replies skip API.
+  4. Pre-render cache for fixed phrases + unclear + opening.
+  5. MEDIA STREAMS: POST /voice-stream returns <Stream>; WS /media-stream does VAD, STT,
+     LLM stream, sentence-by-sentence TTS → push chunks so agent starts in ~2s.
 """
 
 import logging
 import os
 import asyncio
+import re
 import time
 from dotenv import load_dotenv
 
 load_dotenv()
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import Response, JSONResponse
 from groq import AsyncGroq
 from twilio.rest import Client
@@ -39,6 +35,7 @@ from tts import (
     warmup_ws,
     AUDIO_DIR,
 )
+from media_stream import handle_media_stream
 
 logging.basicConfig(
     level=logging.INFO,
@@ -52,6 +49,14 @@ groq_client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
 
 _call_history: dict[str, list[dict[str, str]]] = {}
 
+# Groq model: set GROQ_MODEL in .env (free options: llama-3.1-8b-instant, openai/gpt-oss-20b, llama-3.3-70b-versatile)
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+
+# Sentence boundaries only — full sentences for natural speech (no tiny fragments)
+_SENTENCE_END = re.compile(r"[।.?!]\s*")
+# Safety: if LLM streams this many chars without sentence end, yield anyway so first audio ~2–3s
+_MAX_BUFFER_CHARS = 120
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PRE-RENDERED RESPONSE CACHE
 # All fixed questions + common fallbacks are rendered at startup.
@@ -59,21 +64,22 @@ _call_history: dict[str, list[dict[str, str]]] = {}
 # After serving, re-renders in background so it's ready next call.
 # ─────────────────────────────────────────────────────────────────────────────
 FIXED_RESPONSES: dict[str, str] = {
-    "step1_hi":   "आप किस भाषा में बात करना चाहेंगे — हिंदी या इंग्लिश?",
-    "step2_hi":   "क्या हमारी ब्रांच से आपको कोटेशन मिला है?",
-    "step2_en":   "Has our branch given you a quotation?",
-    "step3_hi":   "आप कितने BHK शिफ्ट कर रहे हैं?",
-    "step3_en":   "How many BHK are you shifting?",
-    "step4_hi":   "पिकअप कौन से फ्लोर पर है और लिफ्ट है?",
-    "step4_en":   "Which floor is the pickup, and is there a lift?",
-    "step5_hi":   "कोटेशन WhatsApp पर भेजूं या ईमेल पर?",
-    "step5_en":   "Should I send the quotation on WhatsApp or email?",
-    "step6_hi":   "पिकअप का पूरा पता और पिनकोड बताएं।",
-    "step6_en":   "Please share the full pickup address with pincode.",
-    "step7_hi":   "सर्वे के लिए कौन सा दिन ठीक रहेगा?",
-    "step7_en":   "Which day works for the survey?",
-    "close_hi":   "धन्यवाद, सर्वे शेड्यूल हो गया है।",
-    "close_en":   "Thank you, the survey has been scheduled.",
+    "step1_hi":   "आगे बढ़ने से पहले, आप किस भाषा में बात करना पसंद करेंगे — हिंदी या इंग्लिश?",
+    "step1_en":   "Before we proceed, which language would you prefer — Hindi or English?",
+    "step2_hi":   "क्या हमारी ब्रांच से किसी ने आपको पहले कॉल किया है और कोटेशन भेजा है?",
+    "step2_en":   "Has anyone from our branch already called you and shared a quotation?",
+    "step3_hi":   "आप एक BHK, दो BHK या तीन BHK शिफ्ट कर रहे हैं?",
+    "step3_en":   "Are you shifting a 1 BHK, 2 BHK, or 3 BHK household?",
+    "step4_hi":   "पिकअप का फ्लोर नंबर क्या है? लिफ्ट है या नहीं? और क्या कोई गाड़ी शिफ्ट करनी है?",
+    "step4_en":   "What is the pickup floor number? Is there a lift? Are any vehicles being shifted?",
+    "step5_hi":   "आप कोटेशन ईमेल पर चाहेंगे या व्हाट्सऐप पर?",
+    "step5_en":   "Would you like the quotation on email or WhatsApp?",
+    "step6_hi":   "कृपया पूरा पिकअप पता पिनकोड सहित बताएं।",
+    "step6_en":   "Please share the complete pickup address with pincode.",
+    "step7_hi":   "किस दिन और समय पर सर्वे के लिए सुविधाजनक रहेगा?",
+    "step7_en":   "Which day and time would be convenient for the survey?",
+    "close_hi":   "आपका समय देने के लिए धन्यवाद। मैंने आपकी जानकारी नोट कर ली है और सर्वे शेड्यूल कर दिया है। आपका दिन शुभ रहे।",
+    "close_en":   "Thank you for your time. I have noted your details and scheduled the survey. Have a great day.",
     "unclear_hi": "कृपया दोबारा बोलें।",
     "unclear_en": "Could you please repeat that?",
 }
@@ -83,67 +89,131 @@ _audio_cache: dict[str, str] = {}
 
 OUTBOUND_OPENING = (
     "नमस्ते। मैं सोनी बोल रही हूं, शर्मा लॉजिस्टिक्स की तरफ से। "
-    "आपकी घर शिफ्टिंग इन्क्वायरी के संबंध में कॉल कर रही हूं। "
+    "मैं आपके घर शिफ्टिंग की इन्क्वायरी के संबंध में कॉल कर रही हूं। "
     "क्या अभी आप एक मिनट बात कर सकते हैं?"
 )
 _opening_audio: str | None = None
 
-SYSTEM_PROMPT = """You are SONY, a voice assistant for Sharma Logistics (phone call).
+SYSTEM_PROMPT = """CRITICAL LANGUAGE POLICY (MANDATORY – OVERRIDES ALL OTHER INSTRUCTIONS):
+1. You MUST always reply in the same language as the user's most recent message.
+2. If the user speaks Hindi, respond completely in Hindi.
+3. If the user speaks English, respond completely in English.
+4. If the user speaks in mixed Hindi and English (Hinglish), respond in simple Hinglish.
+5. Never default to English automatically.
+6. If you are unsure about the user's preferred language, ask:
+   "आप किस भाषा में बात करना चाहेंगे — हिंदी या इंग्लिश?"
+7. Once the user selects a language, continue the entire conversation strictly in that language unless the user switches.
+8. Keep all responses short (maximum 2–3 sentences) and suitable for a phone conversation.
 
-LANGUAGE RULES (STRICT):
-- Default language: Hindi
-- If user speaks English → reply in English only
-- If user speaks Marathi → reply in Marathi only
-- NEVER mix languages in one reply.
-- One language per reply, always.
+------------------------------------------------------------
 
-LENGTH RULE (CRITICAL):
-- Maximum 1 sentence per reply. Hard limit.
-- Short sentences only. This is a phone call.
+You are SONY, a polite and professional AI voice assistant representing Sharma Logistics.
 
-CONVERSATION FLOW (ask questions one at a time, in order):
+Your goal is to:
+- Qualify a household shifting enquiry
+- Collect required details
+- Build trust
+- Schedule a free home survey
 
-STEP 1 — Language check (only if user hasn't established language):
-  Hindi: "आप किस भाषा में बात करना चाहेंगे — हिंदी, इंग्लिश या मराठी?"
-  English: "Which language would you prefer — Hindi, English Or Marathi?"
-  Marathi: "आपण कोणत्या भाषेत बोलू इच्छिता — हिंदी, इंग्लिश की मराठी?"
+Always speak clearly, naturally, patiently, and respectfully.
+Maintain a warm, helpful, and professional tone at all times.
+Keep responses concise and conversational (no long paragraphs).
 
-STEP 2 — Branch quotation:
-  Hindi: "क्या हमारी ब्रांच से आपको कोटेशन मिला है?"
-  English: "Has our branch given you a quotation?"
-  Marathi: "आमच्या शाखेकडून तुम्हाला कोटेशन मिळाले आहे का?"
+------------------------------------------------------------
+CONVERSATION FLOW
 
-STEP 3 — BHK size:
-  Hindi: "आप कितने BHK शिफ्ट कर रहे हैं?"
-  English: "How many BHK are you shifting?"
-  Marathi: "आपण किती BHK शिफ्ट करत आहात?"
+OPENING (For inbound calls):
+नमस्ते। मैं सोनी बोल रही हूं, शर्मा लॉजिस्टिक्स की तरफ से। मैं आपके घर शिफ्टिंग की इन्क्वायरी में मदद करने वाली AI सहायक हूं। क्या अभी आप एक मिनट बात कर सकते हैं?
 
-STEP 4 — Floor and lift:
-  Hindi: "पिकअप कौन से फ्लोर पर है और लिफ्ट है?"
-  English: "Which floor is the pickup, and is there a lift?"
-  Marathi: "पिकअप कोणत्या मजल्यावर आहे आणि लिफ्ट आहे का?"
+OPENING (For outbound calls):
+नमस्ते। मैं सोनी बोल रही हूं, शर्मा लॉजिस्टिक्स की तरफ से। मैं आपके घर शिफ्टिंग की इन्क्वायरी के संबंध में कॉल कर रही हूं। क्या अभी आप एक मिनट बात कर सकते हैं?
 
-STEP 5 — Quotation channel:
-  Hindi: "कोटेशन WhatsApp पर भेजूं या ईमेल पर?"
-  English: "Should I send the quotation on WhatsApp or email?"
-  Marathi: "माझ्या व्हाट्सअपवर कोटेशन पाठवायचे का आणि ईमेल पर?"
+If the user says it is NOT a good time:
+कोई बात नहीं। जब भी सुविधा हो कृपया कॉल कर लें। धन्यवाद।
+(Politely end the call.)
 
-STEP 6 — Address:
-  Hindi: "पिकअप का पूरा पता और पिनकोड बताएं।"
-  English: "Please share the full pickup address with pincode."
-  Marathi: "कृपया पिकअपचा पूर्ण पत्ता आणि पिनकोड सांगा."
+If user agrees to talk:
+आगे बढ़ने से पहले, आप किस भाषा में बात करना पसंद करेंगे — हिंदी या इंग्लिश?
 
-STEP 7 — Survey time:
-  Hindi: "सर्वे के लिए कौन सा दिन ठीक रहेगा?"
-  English: "Which day works for the survey?"
-  Marathi: "सर्वेसाठी कोणता दिवस योग्य राहील?"
+------------------------------------------------------------
+PURPOSE OF THE CALL
 
-CLOSING:
-  Hindi: "धन्यवाद, सर्वे शेड्यूल हो गया है।"
-  English: "Thank you, the survey has been scheduled."
-  Marathi: "धन्यवाद, सर्वे शेड्यूल करण्यात आला आहे."
+If Hindi selected:
+धन्यवाद। मैं आपकी इन्दौर, मध्य प्रदेश से पुणे, महाराष्ट्र तक घर का सामान शिफ्ट करने की इन्क्वायरी के बारे में कॉल कर रही हूं। बस कुछ बातें पक्की कर लूं ताकि हम ठीक से मदद कर सकें।
 
-IMPORTANT: Use EXACTLY the phrases above word-for-word. Do not paraphrase them.
+If English selected:
+Thank you. I am calling regarding your enquiry for shifting your household items from Indore, Madhya Pradesh to Pune, Maharashtra. I just need to confirm a few details so that we can assist you properly.
+
+------------------------------------------------------------
+QUESTIONS FLOW (Ask one at a time, wait for response)
+
+Q1 – Branch Contact Status
+Hindi: क्या हमारी ब्रांच से किसी ने आपको पहले कॉल किया है और कोटेशन भेजा है?
+English: Has anyone from our branch already called you and shared a quotation?
+
+If NO:
+Hindi: देरी के लिए माफी चाहती हूं। हम तुरंत आपकी मदद करेंगे।
+English: I sincerely apologize for the delay. We will assist you immediately.
+
+------------------------------------------------------------
+
+Q2 – Household Size
+Hindi: आप एक BHK, दो BHK या तीन BHK शिफ्ट कर रहे हैं?
+English: Are you shifting a 1 BHK, 2 BHK, or 3 BHK household?
+
+------------------------------------------------------------
+
+Q3 – Move Details
+Hindi: पिकअप का फ्लोर नंबर क्या है? लिफ्ट है या नहीं? और क्या कोई गाड़ी शिफ्ट करनी है?
+English: What is the pickup floor number? Is there a lift? Are any vehicles being shifted?
+
+------------------------------------------------------------
+
+Q4 – Quotation Preference
+Hindi: आप कोटेशन ईमेल पर चाहेंगे या व्हाट्सऐप पर?
+English: Would you like the quotation on email or WhatsApp?
+
+------------------------------------------------------------
+
+Q5 – Address Collection
+Hindi: कृपया पूरा पिकअप पता पिनकोड सहित बताएं।
+English: Please share the complete pickup address with pincode.
+
+------------------------------------------------------------
+
+Q6 – Survey Scheduling
+Hindi: किस दिन और समय पर सर्वे के लिए सुविधाजनक रहेगा?
+English: Which day and time would be convenient for the survey?
+
+------------------------------------------------------------
+
+TRUST BUILDING STATEMENT
+
+Hindi:
+सर्वे के दौरान हमारा फील्ड ऑफिसर सुरक्षित पैकिंग, इंश्योरेंस विकल्प और पारदर्शी कोटेशन की पूरी जानकारी देगा। कोई छुपा चार्ज नहीं होगा।
+
+English:
+During the survey, our field officer will explain safe packing, insurance options, and provide a transparent quotation with no hidden charges.
+
+------------------------------------------------------------
+
+If user is concerned about price:
+
+Hindi:
+आप सिर्फ उतने सामान का भुगतान करेंगे जितना आप शिफ्ट करवाते हैं। अंतिम कोटेशन सामान और दूरी के अनुसार होगा।
+
+English:
+You only pay for the items you move. The final quotation depends on the items and distance.
+
+------------------------------------------------------------
+
+CLOSING
+
+Hindi:
+आपका समय देने के लिए धन्यवाद। मैंने आपकी जानकारी नोट कर ली है और सर्वे शेड्यूल कर दिया है। आपका दिन शुभ रहे।
+
+English:
+Thank you for your time. I have noted your details and scheduled the survey. Have a great day.
 """
 
 
@@ -207,44 +277,69 @@ async def _prerender_all():
         await _one(key, text)
 
 
-async def _run_pipeline(messages: list[dict], call_sid: str, user_input: str) -> tuple[str, str]:
-    """LLM stream → cache check → persistent WS TTS. Returns (filename, reply_text)."""
-    t0 = time.perf_counter()
-
+async def _stream_llm_sentences(messages: list[dict]):
+    """Stream Groq LLM; yield only on sentence end (।.?!). Full sentences = natural speech, first audio in ~2–3s."""
     stream = await groq_client.chat.completions.create(
-        model="llama-3.1-8b-instant",
+        model=GROQ_MODEL,
         messages=messages,
-        max_tokens=55,
+        max_tokens=128,
         temperature=0.1,
         stream=True,
+        tool_choice="none",
     )
-    log.info("⏱  Groq stream open: %.3fs", time.perf_counter() - t0)
-
-    # Buffer LLM output first so we can check the cache before calling TTS.
-    # For short replies (1 sentence, ~30 tokens), buffering costs ~50ms extra
-    # vs streaming, but saves ~600ms on a cache hit. Worth it.
-    ai_reply = ""
+    buffer = ""
     async for chunk in stream:
-        ai_reply += chunk.choices[0].delta.content or ""
-    ai_reply = ai_reply.strip() or "कृपया दोबारा बोलें।"
-    log.info("⏱  LLM done: %.3fs | %s", time.perf_counter() - t0, ai_reply[:60])
+        delta = (chunk.choices[0].delta.content or "") if chunk.choices else ""
+        buffer += delta
+        m = _SENTENCE_END.search(buffer)
+        if m:
+            sentence = buffer[: m.end()].strip()
+            buffer = buffer[m.end() :]
+            if sentence:
+                yield sentence
+        elif len(buffer.strip()) >= _MAX_BUFFER_CHARS:
+            # Long run-on without period: yield so first audio still starts in ~2–3s
+            sentence = buffer.strip()
+            buffer = ""
+            if sentence:
+                yield sentence
+    if buffer.strip():
+        yield buffer.strip()
 
-    # Cache hit? (LLM matched a fixed phrase exactly)
-    filename = _cache_consume(ai_reply)
-    if filename:
-        log.info("⚡ CACHE HIT — 0ms TTS (total: %.3fs)", time.perf_counter() - t0)
+
+async def _run_pipeline(messages: list[dict], call_sid: str, user_input: str) -> tuple[list[str], str]:
+    """Stream LLM to get sentences, then run all TTS in parallel (reference-repo style) → ~4–5s total instead of 8–9s."""
+    t0 = time.perf_counter()
+    # 1. Collect all sentences from stream (fast)
+    sentences: list[str] = []
+    async for sentence in _stream_llm_sentences(messages):
+        if sentence.strip():
+            sentences.append(sentence.strip())
+    ai_reply = " ".join(sentences).strip() or "कृपया दोबारा बोलें।"
+    if not sentences:
+        stream = await groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=messages,
+            max_tokens=128,
+            temperature=0.1,
+            stream=True,
+            tool_choice="none",
+        )
+        fn, ai_reply = await llm_to_tts_stream(stream)
+        ai_reply = ai_reply.strip() or "कृपया दोबारा बोलें।"
+        filenames = [fn]
     else:
-        log.info("Cache miss — calling persistent WS TTS")
-        filename = await synthesise_text(ai_reply)   # persistent WS, near-zero connect overhead
-        log.info("⏱  TTS done: %.3fs", time.perf_counter() - t0)
-
+        # 2. Parallel TTS via REST (WS has single lock; REST allows concurrent requests → ~max(TTS) not sum)
+        tts_tasks = [generate_tts_async(s) for s in sentences]
+        filenames = await asyncio.gather(*tts_tasks)
+        filenames = list(filenames)
+        log.info("⏱  parallel TTS done: %.3fs | %d segment(s)", time.perf_counter() - t0, len(filenames))
     if call_sid:
         hist = _call_history.setdefault(call_sid, [])
-        hist.append({"role": "user",      "content": user_input})
+        hist.append({"role": "user", "content": user_input})
         hist.append({"role": "assistant", "content": ai_reply})
-
-    log.info("⏱  pipeline total: %.3fs", time.perf_counter() - t0)
-    return filename, ai_reply
+    log.info("⏱  pipeline total: %.3fs | %d segment(s) | %s", time.perf_counter() - t0, len(filenames), ai_reply[:60])
+    return filenames, ai_reply
 
 
 async def _handle_voice(form_like) -> Response:
@@ -273,33 +368,32 @@ async def _handle_voice(form_like) -> Response:
             user_input = speech.strip()
 
         # Fast path: serve pre-rendered "please repeat" for unclear speech
-        audio_filename = None
+        audio_filenames: list[str] = []
         ai_reply       = None
         if user_input == "[unclear]":
             for key in ("unclear_hi", "unclear_en"):
                 text = FIXED_RESPONSES[key]
                 fn   = _cache_consume(text)
                 if fn:
-                    audio_filename = fn
+                    audio_filenames = [fn]
                     ai_reply       = text
                     log.info("⚡ Unclear fast path from cache")
                     break
 
-        if not audio_filename:
+        if not audio_filenames:
             messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-            for msg in history[-10:]:
+            for msg in history[-4:]:
                 messages.append(msg)
             messages.append({"role": "user", "content": user_input})
-            audio_filename, ai_reply = await _run_pipeline(messages, call_sid, user_input)
+            audio_filenames, ai_reply = await _run_pipeline(messages, call_sid, user_input)
 
-        audio_url     = f"{ngrok_url}/audio/{audio_filename}"
         record_action = f"{ngrok_url}/voice"
-
+        play_elements = "".join(f'<Play>{ngrok_url}/audio/{fn}</Play>' for fn in audio_filenames)
         twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Play>{audio_url}</Play>
+    {play_elements}
     <Gather input="speech" action="{record_action}" method="POST"
-            speechTimeout="1" timeout="5" actionOnEmptyResult="true"
+            speechTimeout="0.8" timeout="5" actionOnEmptyResult="true"
             language="hi-IN" enhanced="true" />
 </Response>"""
         log.info("⏱  handler total: %.3fs", time.perf_counter() - t0)
@@ -311,12 +405,39 @@ async def _handle_voice(form_like) -> Response:
 <Response>
     <Say language="hi-IN">Technical issue. Please try again.</Say>
     <Gather input="speech" action="{ngrok_url}/voice" method="POST"
-            speechTimeout="1" timeout="5" actionOnEmptyResult="true" language="hi-IN" />
+            speechTimeout="0.8" timeout="5" actionOnEmptyResult="true" language="hi-IN" />
 </Response>"""
         return Response(content=twiml, media_type="text/xml")
 
 
 # ── Lifecycle ──────────────────────────────────────────────────────────────────
+
+def _cleanup_stale_audio(max_age_seconds: int = 300):
+    """Remove .mp3 files in audio_files older than max_age_seconds (e.g. never fetched)."""
+    if not os.path.isdir(AUDIO_DIR):
+        return
+    now = time.time()
+    removed = 0
+    for name in os.listdir(AUDIO_DIR):
+        if not name.endswith(".mp3"):
+            continue
+        path = os.path.join(AUDIO_DIR, name)
+        try:
+            if os.path.isfile(path) and (now - os.path.getmtime(path)) > max_age_seconds:
+                os.remove(path)
+                removed += 1
+        except OSError as e:
+            log.warning("Cleanup could not remove %s: %s", name, e)
+    if removed:
+        log.info("Cleaned %d stale audio file(s) from audio_files", removed)
+
+
+async def _cleanup_audio_loop(interval_seconds: int = 120, max_age_seconds: int = 300):
+    """Background task: periodically delete stale audio files from audio_files."""
+    while True:
+        await asyncio.sleep(interval_seconds)
+        _cleanup_stale_audio(max_age_seconds)
+
 
 @app.on_event("startup")
 async def startup():
@@ -336,7 +457,8 @@ async def startup():
         log.info("✅ Startup cache warm. Cache: %d/%d entries", len(_audio_cache), len(FIXED_RESPONSES))
 
     asyncio.create_task(_startup_prerender())
-    log.info("✅ Startup done — server ready (cache warming in background).")
+    asyncio.create_task(_cleanup_audio_loop(interval_seconds=120, max_age_seconds=300))
+    log.info("✅ Startup done — server ready (cache warming + audio cleanup in background).")
 
 
 @app.on_event("shutdown")
@@ -362,6 +484,31 @@ async def voice_webhook(request: Request):
     form   = await request.form()
     params = dict(request.query_params)
     return await _handle_voice({**params, **dict(form)})
+
+
+@app.post("/voice-stream")
+async def voice_stream_webhook(request: Request):
+    """
+    Twilio webhook that returns TwiML with <Stream> so the call uses Media Streams (WebSocket).
+    Set this as the "A call comes in" webhook URL in Twilio to get ~2s "agent starts speaking"
+    via progressive TTS (first sentence played while rest generates).
+    """
+    ngrok_url = os.getenv("NGROK_URL", "").rstrip("/")
+    stream_ws = ngrok_url.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
+    if not stream_ws.endswith("/media-stream"):
+        stream_ws = stream_ws.rstrip("/") + "/media-stream"
+    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Connect>
+        <Stream url="{stream_ws}" />
+    </Connect>
+</Response>"""
+    return Response(content=twiml, media_type="text/xml")
+
+
+@app.websocket("/media-stream")
+async def media_stream_ws(websocket: WebSocket):
+    await handle_media_stream(websocket, SYSTEM_PROMPT, _call_history, groq_client)
 
 
 @app.post("/voice/fallback")
@@ -390,6 +537,11 @@ async def voice_status(request: Request):
 
 @app.get("/audio/{filename}")
 async def serve_audio(filename: str):
+    """
+    Serve TTS audio for Twilio <Play>. After the full clip has been sent (agent has
+    completely delivered the audio), the file is deleted from audio_files so it
+    does not accumulate.
+    """
     if not filename.endswith(".mp3") or ".." in filename or "/" in filename:
         return Response(status_code=404)
     filepath = os.path.join(AUDIO_DIR, filename)
@@ -399,8 +551,9 @@ async def serve_audio(filename: str):
         data = f.read()
     try:
         os.remove(filepath)
-    except OSError:
-        pass
+        log.debug("Deleted after serve: %s", filename)
+    except OSError as e:
+        log.warning("Could not delete audio after serve %s: %s", filename, e)
     return Response(content=data, media_type="audio/mpeg")
 
 
@@ -433,7 +586,7 @@ async def call_user(mobile_number: str):
         "<Response>"
         f"<Play>{audio_url}</Play>"
         f'<Gather input="speech" action="{record_action}" method="POST" '
-        'speechTimeout="1" timeout="5" actionOnEmptyResult="true" '
+        'speechTimeout="0.8" timeout="5" actionOnEmptyResult="true" '
         'language="hi-IN" enhanced="true" />'
         "</Response>"
     )
