@@ -27,7 +27,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from stt import transcribe_audio_async
-from tts import synthesise_text, synthesise_text_bytes, generate_tts_async, AUDIO_DIR
+from tts import synthesise_text, synthesise_text_bytes, AUDIO_DIR
 
 log = logging.getLogger(__name__)
 
@@ -171,28 +171,14 @@ class MediaStreamHandler:
                     {"role": "user", "content": user_text.strip()}
                 )
             full_reply = ""
-            # Collect sentences from stream, then parallel TTS (reference-repo style → lower total time)
-            sentences_list: list[str] = []
+            # Progressive TTS: send each sentence as soon as ready (reference-repo style → ~2–3s to first audio)
             async for sentence in self._stream_llm_sentences(messages):
-                if sentence.strip():
-                    sentences_list.append(sentence.strip())
-                    full_reply += sentence.strip() + " "
+                if not sentence.strip():
+                    continue
+                full_reply += sentence.strip() + " "
+                if not await self._send_tts_safe(ws, sentence.strip()):
+                    break  # WS closed (call ended)
             full_reply = full_reply.strip()
-            if sentences_list:
-                # Parallel TTS via REST so total time = LLM_time + max(TTS) not sum(TTS)
-                tts_tasks = [generate_tts_async(s) for s in sentences_list]
-                filenames = await asyncio.gather(*tts_tasks)
-                for fn in filenames:
-                    filepath = os.path.join(AUDIO_DIR, fn)
-                    try:
-                        with open(filepath, "rb") as f:
-                            mp3_bytes = f.read()
-                        await self._send_mp3_to_ws(ws, mp3_bytes)
-                    finally:
-                        try:
-                            os.remove(filepath)
-                        except OSError:
-                            pass
             if self.call_sid and full_reply:
                 self.call_history.setdefault(self.call_sid, []).append(
                     {"role": "assistant", "content": full_reply}
@@ -235,47 +221,54 @@ class MediaStreamHandler:
         if buffer.strip():
             yield buffer.strip()
 
-    async def _send_mp3_to_ws(self, ws: WebSocket, mp3_bytes: bytes):
-        """Send MP3 bytes as mulaw chunks to Twilio."""
+    async def _send_mp3_to_ws(self, ws: WebSocket, mp3_bytes: bytes) -> bool:
+        """Send MP3 bytes as mulaw chunks to Twilio. Returns False if WS closed."""
         mulaw = _mp3_to_mulaw_8k(mp3_bytes)
+        return await self._send_mulaw_to_ws(ws, mulaw)
+
+    async def _send_mulaw_to_ws(self, ws: WebSocket, mulaw: bytes) -> bool:
+        """Send mulaw chunks to Twilio. Returns False if WS closed during send."""
         chunk_size = 160
         for i in range(0, len(mulaw), chunk_size):
             chunk = mulaw[i : i + chunk_size]
             b64 = base64.b64encode(chunk).decode("ascii")
-            await ws.send_text(json.dumps({
-                "event": "media",
-                "streamSid": self.stream_sid,
-                "media": {"payload": b64},
-            }))
+            try:
+                await ws.send_text(json.dumps({
+                    "event": "media",
+                    "streamSid": self.stream_sid,
+                    "media": {"payload": b64},
+                }))
+            except RuntimeError as e:
+                if "websocket.send" in str(e) or "already completed" in str(e):
+                    log.debug("WS closed during send, stopping")
+                    return False
+                raise
+            except Exception as e:
+                log.debug("WS send error: %s", e)
+                return False
             await asyncio.sleep(0.02)
+        return True
 
-    async def _send_tts(self, ws: WebSocket, text: str):
-        # In-memory path (no file I/O) for 2–3s response (reference repo pattern)
+    async def _send_tts_safe(self, ws: WebSocket, text: str) -> bool:
+        """Generate TTS for text, send to WS. Returns False if WS closed (call ended)."""
         mp3_bytes = await synthesise_text_bytes(text)
         if mp3_bytes:
-            mulaw = _mp3_to_mulaw_8k(mp3_bytes)
-        else:
-            filename = await synthesise_text(text)
-            filepath = os.path.join(AUDIO_DIR, filename)
+            return await self._send_mp3_to_ws(ws, mp3_bytes)
+        filename = await synthesise_text(text)
+        filepath = os.path.join(AUDIO_DIR, filename)
+        try:
+            with open(filepath, "rb") as f:
+                mp3_bytes = f.read()
+            return await self._send_mp3_to_ws(ws, mp3_bytes)
+        finally:
             try:
-                with open(filepath, "rb") as f:
-                    mp3_bytes = f.read()
-                mulaw = _mp3_to_mulaw_8k(mp3_bytes)
-            finally:
-                try:
-                    os.remove(filepath)
-                except OSError:
-                    pass
-        chunk_size = 160
-        for i in range(0, len(mulaw), chunk_size):
-            chunk = mulaw[i : i + chunk_size]
-            b64 = base64.b64encode(chunk).decode("ascii")
-            await ws.send_text(json.dumps({
-                "event": "media",
-                "streamSid": self.stream_sid,
-                "media": {"payload": b64},
-            }))
-            await asyncio.sleep(0.02)
+                os.remove(filepath)
+            except OSError:
+                pass
+
+    async def _send_tts(self, ws: WebSocket, text: str):
+        """Generate TTS and send to WS. Swallows errors if WS already closed."""
+        await self._send_tts_safe(ws, text)
 
 
 async def handle_media_stream(

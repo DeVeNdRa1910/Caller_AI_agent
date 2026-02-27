@@ -570,6 +570,7 @@ async def call_user(mobile_number: str):
     if not ngrok_url:
         return JSONResponse({"error": "NGROK_URL not set"}, status_code=400)
 
+    # Pre-render opening once (so Twilio can play it immediately)
     if _opening_audio and os.path.isfile(os.path.join(AUDIO_DIR, _opening_audio)):
         audio_filename = _opening_audio
         _opening_audio = None
@@ -579,15 +580,21 @@ async def call_user(mobile_number: str):
         except Exception as e:
             return JSONResponse({"error": f"TTS failed: {e}"}, status_code=500)
 
-    audio_url     = f"{ngrok_url}/audio/{audio_filename}"
-    record_action = f"{ngrok_url}/voice"
+    audio_url = f"{ngrok_url}/audio/{audio_filename}"
+
+    # Use Media Streams (WebSocket) after the opening message instead of <Gather>.
+    # This matches the ultra-low-latency design from the reference repo: Twilio
+    # streams audio to /media-stream, and our VAD+STT+LLM+TTS pipeline responds
+    # in ~2–4s from end-of-speech.
+    stream_ws = ngrok_url.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
+    if not stream_ws.endswith("/media-stream"):
+        stream_ws = stream_ws.rstrip("/") + "/media-stream"
+
     twiml = (
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response>"
         f"<Play>{audio_url}</Play>"
-        f'<Gather input="speech" action="{record_action}" method="POST" '
-        'speechTimeout="0.8" timeout="5" actionOnEmptyResult="true" '
-        'language="hi-IN" enhanced="true" />'
+        f"<Connect><Stream url=\"{stream_ws}\" /></Connect>"
         "</Response>"
     )
 
