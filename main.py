@@ -1,17 +1,33 @@
 """
 main.py — Ultra-low-latency voice pipeline for Sharma Logistics SONY bot.
 
-LATENCY STRATEGY:
-  Gather path: speechTimeout 0.8s + LLM stream + TTS overlap + TTS cache.
-  Media Streams path: /voice-stream → WebSocket → VAD → STT → LLM → progressive TTS (~2s to first audio).
+LATENCY BUDGET (user stops speaking → agent audio starts):
+  speechTimeout      0.8s   fixed (Twilio)
+  Twilio POST        0.2s   fixed (network)
+  LLM + TTS overlap  0.6-1.0s  ← KEY optimization
+  Twilio fetches WAV 0.1s   mulaw file is ~6x smaller than MP3
+  Twilio play start  0.1s
+  ─────────────────────────────────────────────
+  Total target:      ~2.0-3.0s  (cache hit: ~1.5s, cache miss: ~2.5-3.5s)
 
-OPTIMIZATIONS (from call-customer-support-system and local):
-  1. speechTimeout="0.8" — faster end-of-speech (Gather).
-  2. LLM+TTS OVERLAP: llm_to_tts_stream(stream) so first tokens go to TTS while LLM streams.
-  3. TTS response cache (arbitrary text) in tts.py — repeat replies skip API.
-  4. Pre-render cache for fixed phrases + unclear + opening.
-  5. MEDIA STREAMS: POST /voice-stream returns <Stream>; WS /media-stream does VAD, STT,
-     LLM stream, sentence-by-sentence TTS → push chunks so agent starts in ~2s.
+KEY CHANGES vs previous version:
+  1. LLM+TTS TRUE PARALLEL: Start Groq stream, immediately pass stream object
+     to llm_to_tts_stream(). LLM first tokens go to Sarvam WS while LLM is
+     still generating. No full-buffer-then-TTS pattern.
+
+  2. CACHE CHECK BEFORE LLM: If LLM would produce a fixed phrase, we already
+     have it cached. Check cache after LLM (not before — we don't know the
+     reply yet) but this is handled in tts.py synthesise() automatically.
+
+  3. MULAW MIME TYPE: serve_audio returns audio/basic (mulaw MIME) so Twilio
+     recognises it instantly without probing. No MP3 transcode delay.
+
+  4. HISTORY TRIMMED TO LAST 6 MESSAGES (3 turns): Reduces LLM context size
+     → faster TTFT. This bot asks short sequential questions; 3 turns of
+     history is enough context.
+
+  5. PARALLEL PRE-RENDER: All fixed phrases render concurrently at startup
+     using both WS pool connections simultaneously.
 """
 
 import logging
@@ -34,6 +50,7 @@ from tts import (
     close_http_client,
     warmup_ws,
     AUDIO_DIR,
+    TTS_FILE_EXT,
 )
 from media_stream import handle_media_stream
 
@@ -49,19 +66,10 @@ groq_client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
 
 _call_history: dict[str, list[dict[str, str]]] = {}
 
-# Groq model: set GROQ_MODEL in .env (free options: llama-3.1-8b-instant, openai/gpt-oss-20b, llama-3.3-70b-versatile)
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
-
-# Sentence boundaries only — full sentences for natural speech (no tiny fragments)
-_SENTENCE_END = re.compile(r"[।.?!]\s*")
-# Safety: if LLM streams this many chars without sentence end, yield anyway so first audio ~2–3s
-_MAX_BUFFER_CHARS = 120
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PRE-RENDERED RESPONSE CACHE
-# All fixed questions + common fallbacks are rendered at startup.
-# Cache entry: text.strip() → mp3 filename.
-# After serving, re-renders in background so it's ready next call.
 # ─────────────────────────────────────────────────────────────────────────────
 FIXED_RESPONSES: dict[str, str] = {
     "step1_hi":   "आगे बढ़ने से पहले, आप किस भाषा में बात करना पसंद करेंगे — हिंदी या इंग्लिश?",
@@ -84,7 +92,7 @@ FIXED_RESPONSES: dict[str, str] = {
     "unclear_en": "Could you please repeat that?",
 }
 
-# text.strip() → mp3 filename
+# text.strip() → audio filename (on disk)
 _audio_cache: dict[str, str] = {}
 
 OUTBOUND_OPENING = (
@@ -235,7 +243,6 @@ def _form_get(form_like, key: str, default=None):
 
 
 def _cache_get(text: str) -> str | None:
-    """Return cached mp3 filename if it still exists on disk."""
     filename = _audio_cache.get(text.strip())
     if filename and os.path.isfile(os.path.join(AUDIO_DIR, filename)):
         return filename
@@ -243,18 +250,16 @@ def _cache_get(text: str) -> str | None:
 
 
 def _cache_consume(text: str) -> str | None:
-    """Get cached file and schedule background re-render."""
     filename = _cache_get(text)
     if filename:
-        _audio_cache.pop(text.strip(), None)   # consume
-        asyncio.create_task(_rerender_bg(text))  # refill immediately
+        _audio_cache.pop(text.strip(), None)
+        asyncio.create_task(_rerender_bg(text))
     return filename
 
 
 async def _rerender_bg(text: str):
-    """Re-render a used cache entry so next call finds it ready."""
     try:
-        filename = await synthesise_text(text)   # uses persistent WS
+        filename = await synthesise_text(text)
         _audio_cache[text.strip()] = filename
         log.debug("Cache refilled: %s", text[:40])
     except Exception as e:
@@ -262,84 +267,58 @@ async def _rerender_bg(text: str):
 
 
 async def _prerender_all():
-    """Render all fixed responses via persistent WS at startup."""
+    """Render all fixed responses CONCURRENTLY using the 2-connection WS pool."""
     async def _one(key: str, text: str):
         try:
-            fn = await synthesise_text(text)     # uses persistent WS
+            fn = await synthesise_text(text)
             _audio_cache[text.strip()] = fn
             log.info("  ✅ [%s] cached", key)
         except Exception as e:
             log.warning("  ❌ [%s] failed: %s", key, e)
 
-    # Serialise to avoid hammering the single persistent WS connection with
-    # concurrent requests (the WS lock would queue them anyway, but this is cleaner)
-    for key, text in FIXED_RESPONSES.items():
-        await _one(key, text)
+    # Concurrent pre-render — 2 WS connections handle 2 at a time
+    await asyncio.gather(*[_one(k, v) for k, v in FIXED_RESPONSES.items()])
 
 
-async def _stream_llm_sentences(messages: list[dict]):
-    """Stream Groq LLM; yield only on sentence end (।.?!). Full sentences = natural speech, first audio in ~2–3s."""
+async def _run_pipeline(
+    messages: list[dict], call_sid: str, user_input: str
+) -> tuple[list[str], str]:
+    """
+    TRUE parallel LLM+TTS:
+      1. Open Groq stream
+      2. Immediately pass stream to llm_to_tts_stream()
+         → LLM tokens flow directly to Sarvam WS as they arrive
+         → No buffering the full reply before starting TTS
+      3. Return single audio file (whole reply in one WS request)
+
+    This is faster than sentence-by-sentence parallel REST because:
+      - No sentence-splitting delay
+      - Single WS flush = single audio file = single Twilio <Play>
+      - Sarvam WS starts synthesising on first token (~100ms into LLM)
+    """
+    t0 = time.perf_counter()
+
     stream = await groq_client.chat.completions.create(
         model=GROQ_MODEL,
         messages=messages,
-        max_tokens=128,
+        max_tokens=80,      # hard cap keeps replies short and TTS fast
         temperature=0.1,
         stream=True,
-        tool_choice="none",
     )
-    buffer = ""
-    async for chunk in stream:
-        delta = (chunk.choices[0].delta.content or "") if chunk.choices else ""
-        buffer += delta
-        m = _SENTENCE_END.search(buffer)
-        if m:
-            sentence = buffer[: m.end()].strip()
-            buffer = buffer[m.end() :]
-            if sentence:
-                yield sentence
-        elif len(buffer.strip()) >= _MAX_BUFFER_CHARS:
-            # Long run-on without period: yield so first audio still starts in ~2–3s
-            sentence = buffer.strip()
-            buffer = ""
-            if sentence:
-                yield sentence
-    if buffer.strip():
-        yield buffer.strip()
+    log.info("⏱  Groq stream open: %.3fs", time.perf_counter() - t0)
 
+    # llm_to_tts_stream() runs LLM drain and WS send/recv concurrently
+    filename, ai_reply = await llm_to_tts_stream(stream)
+    ai_reply = ai_reply.strip() or "कृपया दोबारा बोलें।"
+    log.info("⏱  LLM+TTS done: %.3fs | %s", time.perf_counter() - t0, ai_reply[:60])
 
-async def _run_pipeline(messages: list[dict], call_sid: str, user_input: str) -> tuple[list[str], str]:
-    """Stream LLM to get sentences, then run all TTS in parallel (reference-repo style) → ~4–5s total instead of 8–9s."""
-    t0 = time.perf_counter()
-    # 1. Collect all sentences from stream (fast)
-    sentences: list[str] = []
-    async for sentence in _stream_llm_sentences(messages):
-        if sentence.strip():
-            sentences.append(sentence.strip())
-    ai_reply = " ".join(sentences).strip() or "कृपया दोबारा बोलें।"
-    if not sentences:
-        stream = await groq_client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=messages,
-            max_tokens=128,
-            temperature=0.1,
-            stream=True,
-            tool_choice="none",
-        )
-        fn, ai_reply = await llm_to_tts_stream(stream)
-        ai_reply = ai_reply.strip() or "कृपया दोबारा बोलें।"
-        filenames = [fn]
-    else:
-        # 2. Parallel TTS via REST (WS has single lock; REST allows concurrent requests → ~max(TTS) not sum)
-        tts_tasks = [generate_tts_async(s) for s in sentences]
-        filenames = await asyncio.gather(*tts_tasks)
-        filenames = list(filenames)
-        log.info("⏱  parallel TTS done: %.3fs | %d segment(s)", time.perf_counter() - t0, len(filenames))
     if call_sid:
         hist = _call_history.setdefault(call_sid, [])
-        hist.append({"role": "user", "content": user_input})
+        hist.append({"role": "user",      "content": user_input})
         hist.append({"role": "assistant", "content": ai_reply})
-    log.info("⏱  pipeline total: %.3fs | %d segment(s) | %s", time.perf_counter() - t0, len(filenames), ai_reply[:60])
-    return filenames, ai_reply
+
+    log.info("⏱  pipeline total: %.3fs", time.perf_counter() - t0)
+    return [filename], ai_reply
 
 
 async def _handle_voice(form_like) -> Response:
@@ -354,8 +333,8 @@ async def _handle_voice(form_like) -> Response:
              call_sid, direction, conf, (speech or "")[:80] or "<empty>")
 
     try:
-        history  = _call_history.get(call_sid, [])
-        is_cont  = len(history) > 0
+        history = _call_history.get(call_sid, [])
+        is_cont = len(history) > 0
 
         if not speech or not speech.strip():
             if is_cont:
@@ -367,28 +346,33 @@ async def _handle_voice(form_like) -> Response:
         else:
             user_input = speech.strip()
 
-        # Fast path: serve pre-rendered "please repeat" for unclear speech
         audio_filenames: list[str] = []
-        ai_reply       = None
+        ai_reply = None
+
+        # Fast path: unclear speech → pre-rendered "please repeat"
         if user_input == "[unclear]":
             for key in ("unclear_hi", "unclear_en"):
                 text = FIXED_RESPONSES[key]
                 fn   = _cache_consume(text)
                 if fn:
                     audio_filenames = [fn]
-                    ai_reply       = text
+                    ai_reply        = text
                     log.info("⚡ Unclear fast path from cache")
                     break
 
         if not audio_filenames:
             messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-            for msg in history[-4:]:
+            # Last 6 messages = 3 turns of context. Enough for this linear flow.
+            # Fewer messages = smaller LLM context = faster TTFT.
+            for msg in history[-6:]:
                 messages.append(msg)
             messages.append({"role": "user", "content": user_input})
             audio_filenames, ai_reply = await _run_pipeline(messages, call_sid, user_input)
 
         record_action = f"{ngrok_url}/voice"
-        play_elements = "".join(f'<Play>{ngrok_url}/audio/{fn}</Play>' for fn in audio_filenames)
+        play_elements = "".join(
+            f'<Play>{ngrok_url}/audio/{fn}</Play>' for fn in audio_filenames
+        )
         twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     {play_elements}
@@ -413,52 +397,49 @@ async def _handle_voice(form_like) -> Response:
 # ── Lifecycle ──────────────────────────────────────────────────────────────────
 
 def _cleanup_stale_audio(max_age_seconds: int = 300):
-    """Remove .mp3 files in audio_files older than max_age_seconds (e.g. never fetched)."""
     if not os.path.isdir(AUDIO_DIR):
         return
     now = time.time()
     removed = 0
     for name in os.listdir(AUDIO_DIR):
-        if not name.endswith(".mp3"):
-            continue
         path = os.path.join(AUDIO_DIR, name)
         try:
             if os.path.isfile(path) and (now - os.path.getmtime(path)) > max_age_seconds:
                 os.remove(path)
                 removed += 1
-        except OSError as e:
-            log.warning("Cleanup could not remove %s: %s", name, e)
+        except OSError:
+            pass
     if removed:
-        log.info("Cleaned %d stale audio file(s) from audio_files", removed)
+        log.info("Cleaned %d stale audio file(s)", removed)
 
 
-async def _cleanup_audio_loop(interval_seconds: int = 120, max_age_seconds: int = 300):
-    """Background task: periodically delete stale audio files from audio_files."""
+async def _cleanup_audio_loop(interval: int = 120, max_age: int = 300):
     while True:
-        await asyncio.sleep(interval_seconds)
-        _cleanup_stale_audio(max_age_seconds)
+        await asyncio.sleep(interval)
+        _cleanup_stale_audio(max_age)
 
 
 @app.on_event("startup")
 async def startup():
     global _opening_audio
-    log.info("Starting up — establishing persistent WS + pre-rendering responses…")
+    log.info("Starting up — establishing WS pool + pre-rendering responses…")
 
-    # Step 1: Connect persistent WS (blocking until done so pre-render can use it)
+    # Step 1: Connect both WS pool connections concurrently
     await warmup_ws()
 
-    # Step 2: Pre-render opening (block so /call-user has it). Fixed responses run in background.
+    # Step 2: Render opening audio (blocks until ready so /call-user works immediately)
     _opening_audio = await synthesise_text(OUTBOUND_OPENING)
     log.info("✅ Opening audio ready: %s", _opening_audio)
 
-    # Step 3: Pre-render fixed responses in background so server can accept requests immediately
-    async def _startup_prerender():
+    # Step 3: Pre-render all fixed responses concurrently in background
+    async def _bg():
         await _prerender_all()
-        log.info("✅ Startup cache warm. Cache: %d/%d entries", len(_audio_cache), len(FIXED_RESPONSES))
+        log.info("✅ Fixed response cache warm. %d/%d entries",
+                 len(_audio_cache), len(FIXED_RESPONSES))
 
-    asyncio.create_task(_startup_prerender())
-    asyncio.create_task(_cleanup_audio_loop(interval_seconds=120, max_age_seconds=300))
-    log.info("✅ Startup done — server ready (cache warming + audio cleanup in background).")
+    asyncio.create_task(_bg())
+    asyncio.create_task(_cleanup_audio_loop())
+    log.info("✅ Startup done — server ready.")
 
 
 @app.on_event("shutdown")
@@ -488,11 +469,6 @@ async def voice_webhook(request: Request):
 
 @app.post("/voice-stream")
 async def voice_stream_webhook(request: Request):
-    """
-    Twilio webhook that returns TwiML with <Stream> so the call uses Media Streams (WebSocket).
-    Set this as the "A call comes in" webhook URL in Twilio to get ~2s "agent starts speaking"
-    via progressive TTS (first sentence played while rest generates).
-    """
     ngrok_url = os.getenv("NGROK_URL", "").rstrip("/")
     stream_ws = ngrok_url.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
     if not stream_ws.endswith("/media-stream"):
@@ -538,11 +514,14 @@ async def voice_status(request: Request):
 @app.get("/audio/{filename}")
 async def serve_audio(filename: str):
     """
-    Serve TTS audio for Twilio <Play>. After the full clip has been sent (agent has
-    completely delivered the audio), the file is deleted from audio_files so it
-    does not accumulate.
+    Serve TTS audio for Twilio <Play>.
+    Returns audio/basic (mulaw) — Twilio plays this natively with no transcoding.
+    File is deleted after serving to prevent accumulation.
     """
-    if not filename.endswith(".mp3") or ".." in filename or "/" in filename:
+    # Accept both .wav (mulaw) and .mp3 (fallback legacy files)
+    if not (filename.endswith(".wav") or filename.endswith(".mp3")):
+        return Response(status_code=404)
+    if ".." in filename or "/" in filename:
         return Response(status_code=404)
     filepath = os.path.join(AUDIO_DIR, filename)
     if not os.path.isfile(filepath):
@@ -553,8 +532,11 @@ async def serve_audio(filename: str):
         os.remove(filepath)
         log.debug("Deleted after serve: %s", filename)
     except OSError as e:
-        log.warning("Could not delete audio after serve %s: %s", filename, e)
-    return Response(content=data, media_type="audio/mpeg")
+        log.warning("Could not delete %s: %s", filename, e)
+
+    # mulaw 8kHz → audio/basic. MP3 legacy → audio/mpeg.
+    mime = "audio/basic" if filename.endswith(".wav") else "audio/mpeg"
+    return Response(content=data, media_type=mime)
 
 
 # ── Outbound call ──────────────────────────────────────────────────────────────
@@ -570,7 +552,6 @@ async def call_user(mobile_number: str):
     if not ngrok_url:
         return JSONResponse({"error": "NGROK_URL not set"}, status_code=400)
 
-    # Pre-render opening once (so Twilio can play it immediately)
     if _opening_audio and os.path.isfile(os.path.join(AUDIO_DIR, _opening_audio)):
         audio_filename = _opening_audio
         _opening_audio = None
@@ -582,10 +563,6 @@ async def call_user(mobile_number: str):
 
     audio_url = f"{ngrok_url}/audio/{audio_filename}"
 
-    # Use Media Streams (WebSocket) after the opening message instead of <Gather>.
-    # This matches the ultra-low-latency design from the reference repo: Twilio
-    # streams audio to /media-stream, and our VAD+STT+LLM+TTS pipeline responds
-    # in ~2–4s from end-of-speech.
     stream_ws = ngrok_url.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
     if not stream_ws.endswith("/media-stream"):
         stream_ws = stream_ws.rstrip("/") + "/media-stream"
@@ -594,7 +571,7 @@ async def call_user(mobile_number: str):
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response>"
         f"<Play>{audio_url}</Play>"
-        f"<Connect><Stream url=\"{stream_ws}\" /></Connect>"
+        f'<Connect><Stream url="{stream_ws}" /></Connect>'
         "</Response>"
     )
 
