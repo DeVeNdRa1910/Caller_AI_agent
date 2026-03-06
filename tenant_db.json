@@ -1,0 +1,13 @@
+{
+  "sharma_logistics": {
+    "tenant_id": "sharma_logistics",
+    "name": "Sharma Logistics",
+    "api_key_hash": "79fe19c36a56168df7658ca13ae2446b712d023d3f162e81923ed87eace96791",
+    "created_at": "2026-03-06T09:15:21.030004+00:00",
+    "agent_name": "SAMAAYRA",
+    "system_prompt_override": "string",
+    "extra_context": "",
+    "language_preference": "hi-IN",
+    "active": true
+  }
+}
