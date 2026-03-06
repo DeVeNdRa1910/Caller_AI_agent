@@ -1,33 +1,38 @@
 """
 main.py — Ultra-low-latency voice pipeline for Sharma Logistics SONY bot.
+         Voice provider: Plivo (replaces Twilio)
 
 LATENCY BUDGET (user stops speaking → agent audio starts):
-  speechTimeout      0.8s   fixed (Twilio)
-  Twilio POST        0.2s   fixed (network)
+  speechTimeout      0.8s   fixed (Plivo GetInput)
+  Plivo POST         0.2s   fixed (network)
   LLM + TTS overlap  0.6-1.0s  ← KEY optimization
-  Twilio fetches WAV 0.1s   mulaw file is ~6x smaller than MP3
-  Twilio play start  0.1s
+  Plivo fetches WAV  0.1s   mulaw file is ~6x smaller than MP3
+  Plivo play start   0.1s
   ─────────────────────────────────────────────
   Total target:      ~2.0-3.0s  (cache hit: ~1.5s, cache miss: ~2.5-3.5s)
 
-KEY CHANGES vs previous version:
-  1. LLM+TTS TRUE PARALLEL: Start Groq stream, immediately pass stream object
-     to llm_to_tts_stream(). LLM first tokens go to Sarvam WS while LLM is
-     still generating. No full-buffer-then-TTS pattern.
+PLIVO MIGRATION NOTES (Twilio → Plivo):
+  - twilio SDK              → plivo SDK
+  - TwiML <Gather>          → Plivo XML <GetInput>
+  - TwiML <Play>            → Plivo XML <Play>
+  - CallSid form param      → CallUUID form param
+  - SpeechResult form param → speech form param
+  - Confidence form param   → confidence form param
+  - Direction values        → "inbound" / "outbound-api"
+  - twilio.rest.Client()    → plivo.RestClient()
+  - calls.create(twiml=...) → calls.create(answer_url=..., answer_method=...)
+  - status_callback         → hangup_url (Plivo fires on call end)
+  - Fallback URL            → fallback_url param in calls.create()
+  - Audio MIME for Plivo    → audio/x-wav (mulaw WAV) works natively
 
-  2. CACHE CHECK BEFORE LLM: If LLM would produce a fixed phrase, we already
-     have it cached. Check cache after LLM (not before — we don't know the
-     reply yet) but this is handled in tts.py synthesise() automatically.
-
-  3. MULAW MIME TYPE: serve_audio returns audio/basic (mulaw MIME) so Twilio
-     recognises it instantly without probing. No MP3 transcode delay.
-
-  4. HISTORY TRIMMED TO LAST 6 MESSAGES (3 turns): Reduces LLM context size
-     → faster TTFT. This bot asks short sequential questions; 3 turns of
-     history is enough context.
-
-  5. PARALLEL PRE-RENDER: All fixed phrases render concurrently at startup
-     using both WS pool connections simultaneously.
+ENV VARS REQUIRED:
+  PLIVO_AUTH_ID        (replaces TWILIO_ACCOUNT_SID)
+  PLIVO_AUTH_TOKEN     (replaces TWILIO_AUTH_TOKEN)
+  PLIVO_PHONE_NUMBER   (replaces TWILIO_PHONE_NUMBER)
+  NGROK_URL
+  GROQ_API_KEY
+  SARVAM_API_KEY
+  GROQ_MODEL           (optional, default: llama-3.1-8b-instant)
 """
 
 import logging
@@ -42,7 +47,7 @@ load_dotenv()
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import Response, JSONResponse
 from groq import AsyncGroq
-from twilio.rest import Client
+import plivo                          # pip install plivo
 from tts import (
     generate_tts_async,
     synthesise_text,
@@ -225,13 +230,22 @@ Thank you for your time. I have noted your details and scheduled the survey. Hav
 """
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _is_inbound(direction: str | None) -> bool:
+    """
+    Plivo sets Direction to 'inbound' for incoming calls
+    and 'outbound-api' for API-initiated calls.
+    """
     if not direction:
         return True
     return direction.strip().lower() == "inbound"
 
 
 def _form_get(form_like, key: str, default=None):
+    """Case-insensitive form field lookup."""
     v = form_like.get(key)
     if v is not None and str(v).strip() != "":
         return v
@@ -276,44 +290,39 @@ async def _prerender_all():
         except Exception as e:
             log.warning("  ❌ [%s] failed: %s", key, e)
 
-    # Concurrent pre-render — 2 WS connections handle 2 at a time
     await asyncio.gather(*[_one(k, v) for k, v in FIXED_RESPONSES.items()])
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PIPELINE
+# ─────────────────────────────────────────────────────────────────────────────
+
 async def _run_pipeline(
-    messages: list[dict], call_sid: str, user_input: str
+    messages: list[dict], call_uuid: str, user_input: str
 ) -> tuple[list[str], str]:
     """
     TRUE parallel LLM+TTS:
       1. Open Groq stream
       2. Immediately pass stream to llm_to_tts_stream()
-         → LLM tokens flow directly to Sarvam WS as they arrive
-         → No buffering the full reply before starting TTS
-      3. Return single audio file (whole reply in one WS request)
-
-    This is faster than sentence-by-sentence parallel REST because:
-      - No sentence-splitting delay
-      - Single WS flush = single audio file = single Twilio <Play>
-      - Sarvam WS starts synthesising on first token (~100ms into LLM)
+      3. Return single audio file
     """
     t0 = time.perf_counter()
 
     stream = await groq_client.chat.completions.create(
         model=GROQ_MODEL,
         messages=messages,
-        max_tokens=80,      # hard cap keeps replies short and TTS fast
+        max_tokens=80,
         temperature=0.1,
         stream=True,
     )
     log.info("⏱  Groq stream open: %.3fs", time.perf_counter() - t0)
 
-    # llm_to_tts_stream() runs LLM drain and WS send/recv concurrently
     filename, ai_reply = await llm_to_tts_stream(stream)
     ai_reply = ai_reply.strip() or "कृपया दोबारा बोलें।"
     log.info("⏱  LLM+TTS done: %.3fs | %s", time.perf_counter() - t0, ai_reply[:60])
 
-    if call_sid:
-        hist = _call_history.setdefault(call_sid, [])
+    if call_uuid:
+        hist = _call_history.setdefault(call_uuid, [])
         hist.append({"role": "user",      "content": user_input})
         hist.append({"role": "assistant", "content": ai_reply})
 
@@ -321,19 +330,90 @@ async def _run_pipeline(
     return [filename], ai_reply
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PLIVO XML BUILDER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_response_xml(
+    ngrok_url: str,
+    audio_filenames: list[str],
+    action_url: str,
+) -> str:
+    """
+    Build Plivo XML response.
+
+    Plivo equivalents:
+      <Play>    — plays an audio URL (same name as TwiML)
+      <GetInput>— replaces TwiML <Gather>; collects speech/DTMF
+        - inputType="speech"   → speech recognition
+        - action               → webhook URL for result POST
+        - method               → POST
+        - speechEndTimeout     → replaces speechTimeout (seconds of silence)
+        - timeout              → max wait before no-input
+        - language             → BCP-47 language code
+        - finishOnKey          → (omitted; speech-only)
+
+    NOTE: Plivo posts the recognised text as the 'speech' param (not SpeechResult).
+    """
+    play_elements = "".join(
+        f"<Play>{ngrok_url}/audio/{fn}</Play>" for fn in audio_filenames
+    )
+
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    {play_elements}
+    <GetInput
+        inputType="speech"
+        action="{action_url}"
+        method="POST"
+        speechEndTimeout="0.8"
+        timeout="5"
+        language="hi-IN"
+        redirect="true">
+    </GetInput>
+</Response>"""
+
+
+def _build_error_xml(ngrok_url: str) -> str:
+    """Plivo XML fallback on internal error."""
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Speak language="hi-IN">Technical issue. Please try again.</Speak>
+    <GetInput
+        inputType="speech"
+        action="{ngrok_url}/voice"
+        method="POST"
+        speechEndTimeout="0.8"
+        timeout="5"
+        language="hi-IN"
+        redirect="true">
+    </GetInput>
+</Response>"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CORE VOICE HANDLER
+# ─────────────────────────────────────────────────────────────────────────────
+
 async def _handle_voice(form_like) -> Response:
     t0        = time.perf_counter()
     ngrok_url = os.getenv("NGROK_URL", "").rstrip("/")
-    direction = _form_get(form_like, "Direction") or ""
-    call_sid  = (_form_get(form_like, "CallSid") or "").strip()
-    speech    = _form_get(form_like, "SpeechResult")
-    conf      = _form_get(form_like, "Confidence")
 
-    log.info("▶ turn: sid=%s dir=%s conf=%s speech=%s",
-             call_sid, direction, conf, (speech or "")[:80] or "<empty>")
+    # ── Plivo param names ──────────────────────────────────────────────────
+    # CallUUID  → unique call identifier  (was CallSid in Twilio)
+    # speech    → recognised speech text  (was SpeechResult in Twilio)
+    # confidence→ speech confidence score (same concept, different casing)
+    # Direction → "inbound" or "outbound-api"
+    direction = _form_get(form_like, "Direction") or ""
+    call_uuid = (_form_get(form_like, "CallUUID") or "").strip()
+    speech    = _form_get(form_like, "speech")          # Plivo posts as 'speech'
+    conf      = _form_get(form_like, "confidence")
+
+    log.info("▶ turn: uuid=%s dir=%s conf=%s speech=%s",
+             call_uuid, direction, conf, (speech or "")[:80] or "<empty>")
 
     try:
-        history = _call_history.get(call_sid, [])
+        history = _call_history.get(call_uuid, [])
         is_cont = len(history) > 0
 
         if not speech or not speech.strip():
@@ -362,44 +442,30 @@ async def _handle_voice(form_like) -> Response:
 
         if not audio_filenames:
             messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-            # Last 6 messages = 3 turns of context. Enough for this linear flow.
-            # Fewer messages = smaller LLM context = faster TTFT.
             for msg in history[-6:]:
                 messages.append(msg)
             messages.append({"role": "user", "content": user_input})
-            audio_filenames, ai_reply = await _run_pipeline(messages, call_sid, user_input)
+            audio_filenames, ai_reply = await _run_pipeline(messages, call_uuid, user_input)
 
-        record_action = f"{ngrok_url}/voice"
-        play_elements = "".join(
-            f'<Play>{ngrok_url}/audio/{fn}</Play>' for fn in audio_filenames
-        )
-        twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    {play_elements}
-    <Gather input="speech" action="{record_action}" method="POST"
-            speechTimeout="0.8" timeout="5" actionOnEmptyResult="true"
-            language="hi-IN" enhanced="true" />
-</Response>"""
+        action_url = f"{ngrok_url}/voice"
+        twiml      = _build_response_xml(ngrok_url, audio_filenames, action_url)
+
         log.info("⏱  handler total: %.3fs", time.perf_counter() - t0)
         return Response(content=twiml, media_type="text/xml")
 
     except Exception as e:
         log.exception("Voice handler error: %s", e)
-        twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say language="hi-IN">Technical issue. Please try again.</Say>
-    <Gather input="speech" action="{ngrok_url}/voice" method="POST"
-            speechTimeout="0.8" timeout="5" actionOnEmptyResult="true" language="hi-IN" />
-</Response>"""
-        return Response(content=twiml, media_type="text/xml")
+        return Response(content=_build_error_xml(ngrok_url), media_type="text/xml")
 
 
-# ── Lifecycle ──────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# LIFECYCLE
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _cleanup_stale_audio(max_age_seconds: int = 300):
     if not os.path.isdir(AUDIO_DIR):
         return
-    now = time.time()
+    now     = time.time()
     removed = 0
     for name in os.listdir(AUDIO_DIR):
         path = os.path.join(AUDIO_DIR, name)
@@ -424,14 +490,11 @@ async def startup():
     global _opening_audio
     log.info("Starting up — establishing WS pool + pre-rendering responses…")
 
-    # Step 1: Connect both WS pool connections concurrently
     await warmup_ws()
 
-    # Step 2: Render opening audio (blocks until ready so /call-user works immediately)
     _opening_audio = await synthesise_text(OUTBOUND_OPENING)
     log.info("✅ Opening audio ready: %s", _opening_audio)
 
-    # Step 3: Pre-render all fixed responses concurrently in background
     async def _bg():
         await _prerender_all()
         log.info("✅ Fixed response cache warm. %d/%d entries",
@@ -453,7 +516,9 @@ async def shutdown():
     log.info("Shutdown complete.")
 
 
-# ── Routes ─────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# ROUTES
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/")
 def health():
@@ -462,6 +527,11 @@ def health():
 
 @app.post("/voice")
 async def voice_webhook(request: Request):
+    """
+    Main inbound webhook for Plivo.
+    Set this URL as the 'Answer URL' in your Plivo application/number settings.
+    Plivo will POST: CallUUID, Direction, From, To, speech (after GetInput), confidence, etc.
+    """
     form   = await request.form()
     params = dict(request.query_params)
     return await _handle_voice({**params, **dict(form)})
@@ -469,14 +539,20 @@ async def voice_webhook(request: Request):
 
 @app.post("/voice-stream")
 async def voice_stream_webhook(request: Request):
-    ngrok_url = os.getenv("NGROK_URL", "").rstrip("/")
-    stream_ws = ngrok_url.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
+    """
+    Plivo XML to connect call to a media stream WebSocket.
+    Plivo uses <Stream> inside <Connect> — same concept as Twilio.
+    """
+    ngrok_url  = os.getenv("NGROK_URL", "").rstrip("/")
+    stream_ws  = ngrok_url.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
     if not stream_ws.endswith("/media-stream"):
         stream_ws = stream_ws.rstrip("/") + "/media-stream"
+
+    # Plivo <Stream> XML (same structure as Twilio)
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Connect>
-        <Stream url="{stream_ws}" />
+        <Stream keepCallAlive="true" bidirectional="true" contentType="audio/x-mulaw;rate=8000" url="{stream_ws}" />
     </Connect>
 </Response>"""
     return Response(content=twiml, media_type="text/xml")
@@ -489,9 +565,13 @@ async def media_stream_ws(websocket: WebSocket):
 
 @app.post("/voice/fallback")
 async def voice_fallback():
+    """
+    Plivo fallback URL — set as 'Fallback Answer URL' in Plivo app settings.
+    Called when the primary answer URL fails or times out.
+    """
     twiml = """<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Say language="hi-IN">Could not connect. Goodbye.</Say>
+    <Speak language="hi-IN">Could not connect. Goodbye.</Speak>
     <Hangup/>
 </Response>"""
     return Response(content=twiml, media_type="text/xml")
@@ -499,13 +579,20 @@ async def voice_fallback():
 
 @app.post("/voice/status")
 async def voice_status(request: Request):
+    """
+    Plivo call status / hangup callback.
+    Set as 'Hangup URL' in your Plivo application.
+
+    Plivo posts: CallUUID, CallStatus, Duration, etc.
+    CallStatus values: 'completed', 'busy', 'failed', 'no-answer', 'canceled'
+    """
     try:
-        body     = dict(await request.form())
-        call_sid = body.get("CallSid")
-        status   = (body.get("CallStatus") or "").strip().lower()
-        log.info("Call status: %s → %s", call_sid, status)
-        if call_sid and status == "completed":
-            _call_history.pop(call_sid, None)
+        body      = dict(await request.form())
+        call_uuid = body.get("CallUUID")                     # Plivo: CallUUID
+        status    = (body.get("CallStatus") or "").strip().lower()
+        log.info("Call status: %s → %s", call_uuid, status)
+        if call_uuid and status == "completed":
+            _call_history.pop(call_uuid, None)
     except Exception:
         pass
     return Response(content="", status_code=200)
@@ -514,11 +601,10 @@ async def voice_status(request: Request):
 @app.get("/audio/{filename}")
 async def serve_audio(filename: str):
     """
-    Serve TTS audio for Twilio <Play>.
-    Returns audio/basic (mulaw) — Twilio plays this natively with no transcoding.
+    Serve TTS audio for Plivo <Play>.
+    Returns audio/x-wav (mulaw 8kHz) — Plivo plays this natively.
     File is deleted after serving to prevent accumulation.
     """
-    # Accept both .wav (mulaw) and .mp3 (fallback legacy files)
     if not (filename.endswith(".wav") or filename.endswith(".mp3")):
         return Response(status_code=404)
     if ".." in filename or "/" in filename:
@@ -534,24 +620,46 @@ async def serve_audio(filename: str):
     except OSError as e:
         log.warning("Could not delete %s: %s", filename, e)
 
-    # mulaw 8kHz → audio/basic. MP3 legacy → audio/mpeg.
-    mime = "audio/basic" if filename.endswith(".wav") else "audio/mpeg"
+    # Plivo accepts mulaw WAV as audio/x-wav or audio/wav.
+    # audio/basic (raw mulaw) also works but audio/x-wav is more explicit.
+    mime = "audio/x-wav" if filename.endswith(".wav") else "audio/mpeg"
     return Response(content=data, media_type=mime)
 
 
-# ── Outbound call ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# OUTBOUND CALL  (Plivo SDK)
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/call-user")
 async def call_user(mobile_number: str):
+    """
+    Initiate an outbound call via Plivo REST API.
+
+    Plivo differences vs Twilio:
+      - plivo.RestClient(auth_id, auth_token)  instead of twilio.Client(sid, token)
+      - calls.create(from_=..., to_=..., answer_url=..., answer_method=...)
+        instead of calls.create(from_=..., to=..., twiml=...)
+      - Plivo answer_url must return Plivo XML (not inline TwiML string)
+      - hangup_url replaces status_callback
+      - hangup_url_method replaces status_callback_method
+      - No 'status_callback_event' filter — Plivo always calls hangup_url on completion
+
+    IMPORTANT: The opening audio is played by the answer_url endpoint (/voice-outbound-open),
+    not inline in the API call (Plivo doesn't accept inline TwiML like Twilio does).
+    """
     global _opening_audio
-    account_sid   = os.getenv("TWILIO_ACCOUNT_SID")
-    auth_token    = os.getenv("TWILIO_AUTH_TOKEN")
-    twilio_number = os.getenv("TWILIO_PHONE_NUMBER")
+
+    auth_id       = os.getenv("PLIVO_AUTH_ID")
+    auth_token    = os.getenv("PLIVO_AUTH_TOKEN")
+    plivo_number  = os.getenv("PLIVO_PHONE_NUMBER")
     ngrok_url     = os.getenv("NGROK_URL", "").rstrip("/")
 
     if not ngrok_url:
         return JSONResponse({"error": "NGROK_URL not set"}, status_code=400)
+    if not auth_id or not auth_token or not plivo_number:
+        return JSONResponse({"error": "Plivo credentials not set in .env"}, status_code=400)
 
+    # Prepare opening audio file
     if _opening_audio and os.path.isfile(os.path.join(AUDIO_DIR, _opening_audio)):
         audio_filename = _opening_audio
         _opening_audio = None
@@ -561,27 +669,77 @@ async def call_user(mobile_number: str):
         except Exception as e:
             return JSONResponse({"error": f"TTS failed: {e}"}, status_code=500)
 
-    audio_url = f"{ngrok_url}/audio/{audio_filename}"
+    # Store the audio filename temporarily so /voice-outbound-open can serve it.
+    # A real production system would use a short-lived token or pass via query param.
+    _pending_outbound_audio[mobile_number] = audio_filename
 
-    stream_ws = ngrok_url.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
-    if not stream_ws.endswith("/media-stream"):
-        stream_ws = stream_ws.rstrip("/") + "/media-stream"
+    # Plivo answer_url — called when callee picks up
+    answer_url = f"{ngrok_url}/voice-outbound-open?to={mobile_number}"
 
-    twiml = (
-        '<?xml version="1.0" encoding="UTF-8"?>'
-        "<Response>"
-        f"<Play>{audio_url}</Play>"
-        f'<Connect><Stream url="{stream_ws}" /></Connect>'
-        "</Response>"
-    )
+    plivo_client = plivo.RestClient(auth_id, auth_token)
 
-    twilio_client = Client(account_sid, auth_token)
-    call = twilio_client.calls.create(
-        to=mobile_number,
-        from_=twilio_number,
-        twiml=twiml,
-        status_callback=f"{ngrok_url}/voice/status",
-        status_callback_event=["completed"],
-    )
-    log.info("Outbound call initiated: %s", call.sid)
-    return {"status": "calling", "call_sid": call.sid}
+    try:
+        response = plivo_client.calls.create(
+            from_         = plivo_number,
+            to_           = mobile_number,
+            answer_url    = answer_url,
+            answer_method = "GET",                         # Plivo fetches XML via GET by default
+            hangup_url    = f"{ngrok_url}/voice/status",
+            hangup_method = "POST",
+            fallback_url  = f"{ngrok_url}/voice/fallback",
+            fallback_method = "POST",
+        )
+        call_uuid = response[1].get("request_uuid") or str(response)
+        log.info("Outbound call initiated: %s", call_uuid)
+        return {"status": "calling", "request_uuid": call_uuid}
+    except Exception as e:
+        log.exception("Plivo call creation failed: %s", e)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# Temporary store for outbound opening audio filenames keyed by destination number
+_pending_outbound_audio: dict[str, str] = {}
+
+
+@app.get("/voice-outbound-open")
+async def voice_outbound_open(to: str = ""):
+    """
+    Plivo fetches this URL when the outbound call is answered.
+    Plays the opening audio then hands off to the main /voice webhook
+    via <GetInput> action.
+
+    NOTE: Plivo answer_url is fetched with GET by default (answer_method="GET").
+    The 'to' query param is used to look up the pre-rendered opening audio.
+    """
+    ngrok_url      = os.getenv("NGROK_URL", "").rstrip("/")
+    audio_filename = _pending_outbound_audio.pop(to, None)
+
+    if not audio_filename or not os.path.isfile(os.path.join(AUDIO_DIR, audio_filename)):
+        # Fallback: re-synthesise if pre-rendered file was lost
+        try:
+            audio_filename = await synthesise_text(OUTBOUND_OPENING)
+        except Exception as e:
+            log.error("Failed to synthesise outbound opening: %s", e)
+            return Response(
+                content="""<?xml version="1.0" encoding="UTF-8"?>
+<Response><Speak language="hi-IN">नमस्ते, कृपया प्रतीक्षा करें।</Speak></Response>""",
+                media_type="text/xml",
+            )
+
+    audio_url  = f"{ngrok_url}/audio/{audio_filename}"
+    action_url = f"{ngrok_url}/voice"
+
+    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Play>{audio_url}</Play>
+    <GetInput
+        inputType="speech"
+        action="{action_url}"
+        method="POST"
+        speechEndTimeout="0.8"
+        timeout="5"
+        language="hi-IN"
+        redirect="true">
+    </GetInput>
+</Response>"""
+    return Response(content=twiml, media_type="text/xml")
