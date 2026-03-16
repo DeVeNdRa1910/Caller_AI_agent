@@ -4,8 +4,19 @@
     "name": "Sharma Logistics",
     "api_key_hash": "79fe19c36a56168df7658ca13ae2446b712d023d3f162e81923ed87eace96791",
     "created_at": "2026-03-06T09:15:21.030004+00:00",
-    "agent_name": "SAMAAYRA",
-    "system_prompt_override": "string",
+    "agent_name": "समायरा",
+    "system_prompt_override": null,
+    "extra_context": "",
+    "language_preference": "hi-IN",
+    "active": true
+  },
+  "sharma_logistic": {
+    "tenant_id": "sharma_logistic",
+    "name": "Sharma Logistic",
+    "api_key_hash": "3b50ed224da40ecc1681f197d35e1662f42bd998143b2554f96c4c4745c49fbd",
+    "created_at": "2026-03-09T07:32:14.590602+00:00",
+    "agent_name": "सोनी",
+    "system_prompt_override": null,
     "extra_context": "",
     "language_preference": "hi-IN",
     "active": true

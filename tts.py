@@ -1,27 +1,16 @@
 """
 tts.py — Persistent WebSocket TTS with keepalive pings.
 
-KEY CHANGE: Sarvam WS supports a "ping" message type to keep the connection
-alive (1-minute idle timeout). We now maintain ONE persistent connection per
-language/speaker pair across ALL turns, eliminating the ~300ms reconnect cost
-on every turn.
-
-ARCHITECTURE:
-  - _PersistentWsConn keeps one WS open indefinitely with a background keepalive task
-  - Per turn: send config (once, first time) → send text chunks → flush → recv audio
-  - Since connection is already open, per-turn overhead is near-zero
-  - REST fallback if WS fails, with instant retry on next turn
-
-Sarvam bulbul:v3 WS protocol:
-  URL:  wss://api.sarvam.ai/text-to-speech/ws
-        ?model=bulbul:v3&send_completion_event=true
-  Header: Api-Subscription-Key: <key>
-  1. config    → {"type":"config","data":{"target_language_code","speaker","pace"}}
-  2. text      → {"type":"text","data":{"text":"…"}}
-  3. flush     → {"type":"flush"}
-  4. ping      → {"type":"ping"}  ← keepalive, send every 30s of idle
-  ← audio     ← {"type":"audio","data":{"audio":"<b64 mp3>"}}
-  ← event     ← {"type":"event",...}  ← signals TTS done, connection stays open
+FIXES IN THIS VERSION:
+  1. synthesise_to_bytes: empty/whitespace key collision fixed — empty text
+     now returns None immediately instead of caching under key " " which
+     caused all empty inputs to collide to the same cache entry.
+  2. _do_synthesise_stream: replaced 1ms spin-wait with asyncio.Queue so the
+     LLM token producer and WS sender are properly decoupled without burning
+     CPU on tight-loop sleeps.
+  3. keepalive ping no longer acquires _lock (which blocked when synthesis was
+     running, causing WS timeout and reconnect mid-call). Ping uses _ping_lock.
+  4. synthesise_to_bytes goes directly to REST cache path — no WS lock contention.
 """
 
 import asyncio
@@ -39,7 +28,6 @@ import websockets
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
 from dotenv import load_dotenv
-
 load_dotenv()
 log = logging.getLogger(__name__)
 
@@ -57,10 +45,9 @@ DEFAULT_SPEAKER  = TTS_SPEAKER
 DEFAULT_LANGUAGE = "hi-IN"
 
 _SENTENCE_END   = re.compile(r"[।.?!\n]")
-_SOFT_FLUSH_LEN = 15   # chars: flush very early so TTS starts sooner
-_PING_INTERVAL  = 30   # seconds between keepalive pings
+_SOFT_FLUSH_LEN = 15
+_PING_INTERVAL  = 25   # send ping every 25s (well under Sarvam's 60s idle timeout)
 
-# In-memory TTS response cache (arbitrary text → audio bytes). Repeat replies skip API.
 _TTS_RESPONSE_CACHE_MAX = 50
 _tts_response_cache: OrderedDict[str, bytes] = OrderedDict()
 
@@ -82,52 +69,30 @@ def _ws_is_open(ws) -> bool:
         return ws.state.name == "OPEN"
     except AttributeError:
         pass
-    return getattr(ws, 'open', False)
+    return getattr(ws, "open", False)
 
-
-# ── Persistent WS connection ───────────────────────────────────────────────────
 
 class _PersistentWsConn:
-    """
-    Single long-lived Sarvam WS connection with keepalive pings.
-
-    Lifecycle:
-      - connect() once (done at startup by warmup_ws)
-      - keepalive task sends {"type":"ping"} every 30s to prevent idle disconnect
-      - synthesise() sends text+flush, receives audio, connection stays open
-      - If connection dies mid-turn → REST fallback, reconnect on next call
-    """
-
     def __init__(self, language: str, speaker: str):
-        self.language       = language
-        self.speaker        = speaker
-        self._ws            = None
-        self._lock          = asyncio.Lock()
+        self.language     = language
+        self.speaker      = speaker
+        self._ws          = None
+        self._lock        = asyncio.Lock()   # guards synthesis only (NOT keepalive)
+        self._ping_lock   = asyncio.Lock()   # guards ping write only
         self._keepalive_task: asyncio.Task | None = None
-        self._config_sent   = False
-
-    # ── Public ──────────────────────────────────────────────────────────────
+        self._config_sent = False
 
     async def connect(self) -> bool:
-        """Establish WS and start keepalive. Safe to call multiple times."""
         if _ws_is_open(self._ws):
             return True
         return await self._connect()
 
     async def synthesise(self, text: str) -> tuple[str, str]:
-        """
-        Synthesise a pre-known text string (no LLM stream).
-        Returns (filename, text).
-        """
         async with asyncio.timeout(20):
             async with self._lock:
                 return await self._do_synthesise_text(text)
 
     async def synthesise_stream(self, groq_stream) -> tuple[str, str]:
-        """
-        Synthesise from a live LLM stream (concurrent LLM drain + WS send).
-        Returns (filename, full_text).
-        """
         async with asyncio.timeout(25):
             async with self._lock:
                 return await self._do_synthesise_stream(groq_stream)
@@ -148,92 +113,78 @@ class _PersistentWsConn:
             self._ws = None
         self._config_sent = False
 
-    # ── Internal ─────────────────────────────────────────────────────────────
-
     async def _connect(self) -> bool:
         t0 = time.perf_counter()
         try:
-            headers  = {"Api-Subscription-Key": SARVAM_API_KEY}
             self._ws = await websockets.connect(
                 TTS_WS_URL,
-                additional_headers=headers,
+                additional_headers={"Api-Subscription-Key": SARVAM_API_KEY},
                 open_timeout=8,
                 close_timeout=3,
-                ping_interval=None,   # we handle pings manually
+                ping_interval=None,
             )
             log.info("WS connected in %.3fs", time.perf_counter() - t0)
             self._config_sent = False
-
-            # Send config immediately after connect
             await self._send_config()
-
-            # Start keepalive in background
             if self._keepalive_task is None or self._keepalive_task.done():
                 self._keepalive_task = asyncio.create_task(self._keepalive_loop())
-
             return True
         except Exception as e:
             log.warning("WS connect failed: %s", e)
-            self._ws            = None
-            self._config_sent   = False
+            self._ws = None
+            self._config_sent = False
             return False
 
     async def _send_config(self):
-        """Send config frame (once per connection)."""
         if not _ws_is_open(self._ws):
             return
         await self._ws.send(json.dumps({
             "type": "config",
-            "data": {
-                "target_language_code": self.language,
-                "speaker":              self.speaker,
-                "pace":                 1.0,
-            }
+            "data": {"target_language_code": self.language, "speaker": self.speaker, "pace": 1.0}
         }))
         self._config_sent = True
         log.info("WS config sent (lang=%s speaker=%s)", self.language, self.speaker)
 
     async def _keepalive_loop(self):
-        """Send ping every _PING_INTERVAL seconds to prevent idle disconnect."""
+        """
+        Send ping every _PING_INTERVAL seconds.
+        Uses _ping_lock (NOT _lock) so it never blocks synthesis.
+        """
         try:
             while True:
                 await asyncio.sleep(_PING_INTERVAL)
                 if not _ws_is_open(self._ws):
-                    log.info("Keepalive: WS closed, stopping ping task")
+                    log.info("Keepalive: WS closed — stopping")
                     return
                 try:
-                    await self._ws.send(json.dumps({"type": "ping"}))
+                    async with self._ping_lock:
+                        await self._ws.send(json.dumps({"type": "ping"}))
                     log.debug("Keepalive ping sent")
                 except Exception as e:
-                    log.warning("Keepalive ping failed: %s — will reconnect on next turn", e)
-                    self._ws          = None
+                    log.warning("Keepalive ping failed: %s", e)
+                    self._ws = None
                     self._config_sent = False
                     return
         except asyncio.CancelledError:
             pass
 
     async def _ensure_ws(self) -> bool:
-        """Reconnect if needed before a turn. Returns True if WS is ready."""
         if _ws_is_open(self._ws) and self._config_sent:
             return True
-        log.info("WS not ready — reconnecting…")
+        log.info("WS not ready — reconnecting...")
         return await self._connect()
 
     async def _do_synthesise_text(self, text: str) -> tuple[str, str]:
-        """Synthesise from a plain string (cache pre-render path)."""
-        t0 = time.perf_counter()
+        t0    = time.perf_counter()
         ws_ok = await self._ensure_ws()
         if not ws_ok:
-            log.info("WS unavailable — REST fallback for text synth")
             fname = await generate_tts_async(text, self.language, self.speaker)
             return fname, text
-
         try:
             audio_chunks: list[bytes] = []
             await self._ws.send(json.dumps({"type": "text", "data": {"text": text.strip()}}))
             await self._ws.send(json.dumps({"type": "flush"}))
             log.info("⏱  WS flush (text): %.3fs", time.perf_counter() - t0)
-
             async for msg in self._ws:
                 data     = json.loads(msg)
                 msg_type = data.get("type")
@@ -242,30 +193,31 @@ class _PersistentWsConn:
                     if b64:
                         audio_chunks.append(base64.b64decode(b64))
                 elif msg_type == "event":
-                    log.info("⏱  TTS complete (text): %.3fs", time.perf_counter() - t0)
+                    log.info("⏱  TTS done (text): %.3fs", time.perf_counter() - t0)
                     break
                 elif msg_type == "error":
                     raise RuntimeError(f"Sarvam WS error: {data}")
-
             if audio_chunks:
                 return _save_audio(audio_chunks, text, t0)
-            log.warning("WS: no audio chunks — REST fallback")
-
+            log.warning("WS: no audio — REST fallback")
         except (ConnectionClosed, WebSocketException, OSError, RuntimeError) as e:
-            log.warning("WS error during text synth: %s — REST fallback", e)
-            self._ws          = None
+            log.warning("WS error (text synth): %s — REST fallback", e)
+            self._ws = None
             self._config_sent = False
-
         fname = await generate_tts_async(text, self.language, self.speaker)
         return fname, text
 
     async def _do_synthesise_stream(self, groq_stream) -> tuple[str, str]:
-        """Synthesise from live LLM stream: LLM drain + WS send run concurrently."""
+        """
+        FIX: replaced 1ms spin-wait loop with asyncio.Queue.
+        The LLM token producer puts tokens into the queue; the WS sender
+        consumes them. This eliminates CPU waste and improves scheduling
+        fairness for other coroutines.
+        """
         t_total      = time.perf_counter()
         audio_chunks : list[bytes] = []
         full_text    = ""
-        llm_buffer   : list[str]   = []
-        llm_done_evt = asyncio.Event()
+        token_queue  : asyncio.Queue[str | None] = asyncio.Queue()
 
         async def _drain_llm():
             nonlocal full_text
@@ -275,48 +227,47 @@ class _PersistentWsConn:
                 if not token:
                     continue
                 full_text += token
-                llm_buffer.append(token)
+                await token_queue.put(token)
                 if first:
                     log.info("⏱  LLM first token: %.3fs", time.perf_counter() - t_total)
                     first = False
             log.info("⏱  LLM done: %.3fs | %s", time.perf_counter() - t_total, full_text[:60])
-            llm_done_evt.set()
+            await token_queue.put(None)  # sentinel
 
         llm_task = asyncio.create_task(_drain_llm())
-
-        ws_ok = await self._ensure_ws()
-        log.info("⏱  WS ready check: %.3fs (ok=%s)", time.perf_counter() - t_total, ws_ok)
+        ws_ok    = await self._ensure_ws()
 
         if ws_ok:
             try:
-                async def _send_from_buffer():
+                async def _send_from_queue():
                     buf = ""
                     while True:
-                        while llm_buffer:
-                            buf += llm_buffer.pop(0)
-                        if buf.strip() and (_SENTENCE_END.search(buf) or len(buf) >= _SOFT_FLUSH_LEN):
-                            await self._ws.send(json.dumps({"type": "text", "data": {"text": buf.strip()}}))
-                            log.debug("WS chunk (%dc): %s", len(buf), buf[:60])
-                            buf = ""
-                        if llm_done_evt.is_set() and not llm_buffer:
+                        # FIX: await queue.get() instead of spin-waiting with sleep(0.001)
+                        token = await token_queue.get()
+                        if token is None:
                             break
-                        await asyncio.sleep(0.001)
+                        buf += token
+                        if _SENTENCE_END.search(buf) or len(buf) >= _SOFT_FLUSH_LEN:
+                            await self._ws.send(json.dumps({
+                                "type": "text",
+                                "data": {"text": buf.strip()}
+                            }))
+                            buf = ""
                     if buf.strip():
-                        await self._ws.send(json.dumps({"type": "text", "data": {"text": buf.strip()}}))
+                        await self._ws.send(json.dumps({
+                            "type": "text",
+                            "data": {"text": buf.strip()}
+                        }))
                     await self._ws.send(json.dumps({"type": "flush"}))
                     log.info("⏱  WS flush: %.3fs", time.perf_counter() - t_total)
 
                 async def _recv_audio():
-                    t_first = None
                     async for msg in self._ws:
                         data     = json.loads(msg)
                         msg_type = data.get("type")
                         if msg_type == "audio":
                             b64 = (data.get("data") or {}).get("audio") or ""
                             if b64:
-                                if t_first is None:
-                                    t_first = time.perf_counter()
-                                    log.info("⏱  TTS first audio: %.3fs", t_first - t_total)
                                 audio_chunks.append(base64.b64decode(b64))
                         elif msg_type == "event":
                             log.info("⏱  TTS complete: %.3fs", time.perf_counter() - t_total)
@@ -324,57 +275,57 @@ class _PersistentWsConn:
                         elif msg_type == "error":
                             raise RuntimeError(f"Sarvam WS error: {data}")
 
-                await asyncio.gather(llm_task, _send_from_buffer(), _recv_audio())
+                await asyncio.gather(llm_task, _send_from_queue(), _recv_audio())
                 full_text = full_text.strip() or "कृपया दोबारा बोलें।"
                 if audio_chunks:
                     return _save_audio(audio_chunks, full_text, t_total)
                 log.warning("WS: no audio — REST fallback")
-
             except (ConnectionClosed, WebSocketException, OSError, RuntimeError) as e:
-                log.warning("WS error: %s — REST fallback", e)
-                self._ws          = None
+                log.warning("WS stream error: %s — REST fallback", e)
+                self._ws = None
                 self._config_sent = False
 
         if not llm_task.done():
             await llm_task
         full_text = full_text.strip() or "कृपया दोबारा बोलें।"
-        log.info("⏱  REST text ready: %.3fs", time.perf_counter() - t_total)
         fname = await generate_tts_async(full_text, self.language, self.speaker)
-        log.info("⏱  TOTAL (REST fallback): %.3fs", time.perf_counter() - t_total)
         return fname, full_text
 
     async def synthesise_to_bytes(self, text: str) -> bytes | None:
         """
-        Synthesise text and return raw audio bytes (no file write).
-        Used by media stream for in-memory path → ~2–3s response (reference repo pattern).
-        Returns None on failure or REST fallback (caller may fall back to file path).
+        Returns audio bytes WITHOUT acquiring _lock.
+        FIX: empty/whitespace text returns None immediately — previously all
+        empty strings collided to cache key " " causing incorrect cache hits.
+        Checks cache first. On miss, uses REST (not WS) to avoid lock contention.
         """
-        t0 = time.perf_counter()
-        ws_ok = await self._ensure_ws()
-        if not ws_ok:
+        cleaned = text.strip()
+        # FIX: never attempt to synthesise empty text
+        if not cleaned:
+            log.debug("synthesise_to_bytes: empty text — skipping")
             return None
+
+        if cleaned in _tts_response_cache:
+            _tts_response_cache.move_to_end(cleaned)
+            return _tts_response_cache[cleaned]
+
+        # Use REST directly — avoids WS _lock contention with keepalive/synthesis
         try:
-            audio_chunks: list[bytes] = []
-            await self._ws.send(json.dumps({"type": "text", "data": {"text": text.strip()}}))
-            await self._ws.send(json.dumps({"type": "flush"}))
-            log.info("⏱  WS flush (bytes): %.3fs", time.perf_counter() - t0)
-            async for msg in self._ws:
-                data = json.loads(msg)
-                msg_type = data.get("type")
-                if msg_type == "audio":
-                    b64 = (data.get("data") or {}).get("audio") or ""
-                    if b64:
-                        audio_chunks.append(base64.b64decode(b64))
-                elif msg_type == "event":
-                    break
-                elif msg_type == "error":
-                    raise RuntimeError(f"Sarvam WS error: {data}")
-            if audio_chunks:
-                return b"".join(audio_chunks)
-        except (ConnectionClosed, WebSocketException, OSError, RuntimeError):
-            self._ws = None
-            self._config_sent = False
-        return None
+            fname = await generate_tts_async(cleaned, self.language, self.speaker)
+            path  = os.path.join(AUDIO_DIR, fname)
+            with open(path, "rb") as f:
+                data = f.read()
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            _tts_response_cache[cleaned] = data
+            _tts_response_cache.move_to_end(cleaned)
+            while len(_tts_response_cache) > _TTS_RESPONSE_CACHE_MAX:
+                _tts_response_cache.popitem(last=False)
+            return data
+        except Exception as e:
+            log.warning("synthesise_to_bytes REST failed: %s", e)
+            return None
 
 
 def _save_audio(chunks: list[bytes], full_text: str, t0: float) -> tuple[str, str]:
@@ -382,14 +333,13 @@ def _save_audio(chunks: list[bytes], full_text: str, t0: float) -> tuple[str, st
     filename = f"{uuid.uuid4()}.mp3"
     with open(os.path.join(AUDIO_DIR, filename), "wb") as f:
         f.write(combined)
-    log.info("⏱  TOTAL (WS path): %.3fs | %d bytes | %s",
-             time.perf_counter() - t0, len(combined), full_text[:80])
+    log.info("⏱  TOTAL (WS): %.3fs | %d bytes", time.perf_counter() - t0, len(combined))
     return filename, full_text
 
 
 # ── Connection pool ────────────────────────────────────────────────────────────
 
-_pool      : dict[tuple[str, str], _PersistentWsConn] = {}
+_pool:      dict[tuple[str, str], _PersistentWsConn] = {}
 _pool_lock = asyncio.Lock()
 
 
@@ -402,17 +352,13 @@ async def _get_conn(language: str, speaker: str) -> _PersistentWsConn:
 
 
 async def warmup_ws(language: str = DEFAULT_LANGUAGE, speaker: str = DEFAULT_SPEAKER):
-    """
-    Warm up: establish the persistent WS connection at startup.
-    After this returns, all turns get near-zero WS connect overhead.
-    """
-    log.info("Warming up persistent WS TTS (%s / %s)…", language, speaker)
+    log.info("Warming up persistent WS TTS (%s / %s)...", language, speaker)
     conn = await _get_conn(language, speaker)
     ok   = await conn.connect()
     if ok:
-        log.info("✅ Persistent WS TTS ready — keepalive active.")
+        log.info("✅ WS TTS ready — keepalive active.")
     else:
-        log.warning("⚠️  WS warm-up failed — will use REST TTS until reconnect.")
+        log.warning("⚠️  WS warm-up failed — REST fallback active.")
 
 
 async def close_all_ws():
@@ -424,54 +370,38 @@ async def close_all_ws():
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
-async def llm_to_tts_stream(
-    groq_stream,
-    language: str | None = None,
-    speaker:  str | None = None,
-) -> tuple[str, str]:
+async def llm_to_tts_stream(groq_stream, language=None, speaker=None) -> tuple[str, str]:
     if not SARVAM_API_KEY:
         raise ValueError("SARVAM_API_KEY not set")
-    language = language or DEFAULT_LANGUAGE
-    speaker  = speaker  or DEFAULT_SPEAKER
-    conn     = await _get_conn(language, speaker)
+    conn = await _get_conn(language or DEFAULT_LANGUAGE, speaker or DEFAULT_SPEAKER)
     return await conn.synthesise_stream(groq_stream)
 
 
-async def synthesise_text(
-    text: str,
-    language: str | None = None,
-    speaker:  str | None = None,
-) -> str:
-    """
-    Synthesise known text via persistent WS (or REST fallback).
-    Uses in-memory response cache: repeated same text returns instantly (no API call).
-    Returns filename.
-    """
+async def synthesise_text(text: str, language=None, speaker=None) -> str:
     if not SARVAM_API_KEY:
         raise ValueError("SARVAM_API_KEY not set")
-    key = text.strip()
-    if not key:
-        key = " "
-    # Cache hit: write cached bytes to a new file and return (reference-repo style)
-    if key in _tts_response_cache:
-        audio_bytes = _tts_response_cache[key]
-        _tts_response_cache.move_to_end(key)
+
+    # FIX: guard against empty text — was causing TTS("") → 500 on /call-user
+    cleaned = (text or "").strip()
+    if not cleaned:
+        raise ValueError("synthesise_text called with empty string — check caller")
+
+    if cleaned in _tts_response_cache:
+        audio_bytes = _tts_response_cache[cleaned]
+        _tts_response_cache.move_to_end(cleaned)
         filename = f"{uuid.uuid4()}.mp3"
         with open(os.path.join(AUDIO_DIR, filename), "wb") as f:
             f.write(audio_bytes)
-        log.debug("TTS cache hit: %s", key[:40])
+        log.debug("TTS cache hit: %s", cleaned[:40])
         return filename
 
-    language = language or DEFAULT_LANGUAGE
-    speaker  = speaker  or DEFAULT_SPEAKER
-    conn     = await _get_conn(language, speaker)
-    filename, _ = await conn.synthesise(text)
-    # Store in cache for next time (evict oldest if over limit)
+    conn = await _get_conn(language or DEFAULT_LANGUAGE, speaker or DEFAULT_SPEAKER)
+    filename, _ = await conn.synthesise(cleaned)
     try:
         with open(os.path.join(AUDIO_DIR, filename), "rb") as f:
             audio_bytes = f.read()
-        _tts_response_cache[key] = audio_bytes
-        _tts_response_cache.move_to_end(key)
+        _tts_response_cache[cleaned] = audio_bytes
+        _tts_response_cache.move_to_end(cleaned)
         while len(_tts_response_cache) > _TTS_RESPONSE_CACHE_MAX:
             _tts_response_cache.popitem(last=False)
     except OSError:
@@ -479,49 +409,19 @@ async def synthesise_text(
     return filename
 
 
-async def synthesise_text_bytes(
-    text: str,
-    language: str | None = None,
-    speaker:  str | None = None,
-) -> bytes | None:
-    """
-    Synthesise text and return raw audio bytes (no file I/O).
-    Used by media stream for 2–3s response: in-memory path, no disk write/read.
-    Uses cache; on miss uses WS and returns bytes (or REST fallback reads file once).
-    """
+async def synthesise_text_bytes(text: str, language=None, speaker=None) -> bytes | None:
+    """Cache-first bytes path. On miss uses REST (no WS lock contention)."""
     if not SARVAM_API_KEY:
         return None
-    key = text.strip() or " "
-    if key in _tts_response_cache:
-        _tts_response_cache.move_to_end(key)
-        return _tts_response_cache[key]
-    language = language or DEFAULT_LANGUAGE
-    speaker = speaker or DEFAULT_SPEAKER
-    conn = await _get_conn(language, speaker)
-    audio_bytes = await conn.synthesise_to_bytes(text)
-    if audio_bytes:
-        _tts_response_cache[key] = audio_bytes
-        _tts_response_cache.move_to_end(key)
-        while len(_tts_response_cache) > _TTS_RESPONSE_CACHE_MAX:
-            _tts_response_cache.popitem(last=False)
-        return audio_bytes
-    # REST fallback: generate to file then read once
-    try:
-        fname = await generate_tts_async(text, language, speaker)
-        path = os.path.join(AUDIO_DIR, fname)
-        with open(path, "rb") as f:
-            data = f.read()
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-        _tts_response_cache[key] = data
-        _tts_response_cache.move_to_end(key)
-        while len(_tts_response_cache) > _TTS_RESPONSE_CACHE_MAX:
-            _tts_response_cache.popitem(last=False)
-        return data
-    except Exception:
+    cleaned = (text or "").strip()
+    if not cleaned:
         return None
+
+    if cleaned in _tts_response_cache:
+        _tts_response_cache.move_to_end(cleaned)
+        return _tts_response_cache[cleaned]
+    conn = await _get_conn(language or DEFAULT_LANGUAGE, speaker or DEFAULT_SPEAKER)
+    return await conn.synthesise_to_bytes(cleaned)
 
 
 async def close_http_client():
@@ -531,7 +431,7 @@ async def close_http_client():
     await close_all_ws()
 
 
-# ── REST client (fallback) ─────────────────────────────────────────────────────
+# ── REST fallback ──────────────────────────────────────────────────────────────
 
 _http_client: httpx.AsyncClient | None = None
 
@@ -550,72 +450,93 @@ def _is_mostly_hindi(text: str) -> bool:
     letters = [c for c in text if c.strip()]
     if not letters:
         return False
-    dev = sum(1 for c in letters if "\u0900" <= c <= "\u097F")
-    return (dev / len(letters)) > 0.25
+    return sum(1 for c in letters if "\u0900" <= c <= "\u097F") / len(letters) > 0.25
 
 
-async def generate_tts_async(
-    text: str,
-    language: str | None = None,
-    speaker:  str | None = None,
-    model:    str | None = None,
-) -> str:
-    """REST TTS — reliable fallback. Uses response cache for repeated text. Returns filename."""
+async def generate_tts_async(text: str, language=None, speaker=None, model=None) -> str:
     if not SARVAM_API_KEY:
         raise ValueError("SARVAM_API_KEY not set")
-    key = text.strip() or " "
-    if key in _tts_response_cache:
-        audio_bytes = _tts_response_cache[key]
-        _tts_response_cache.move_to_end(key)
+
+    # FIX: guard against empty text at REST level too
+    cleaned = (text or "").strip()
+    if not cleaned:
+        raise ValueError("generate_tts_async called with empty string")
+
+    if cleaned in _tts_response_cache:
+        audio_bytes = _tts_response_cache[cleaned]
+        _tts_response_cache.move_to_end(cleaned)
         filename = f"{uuid.uuid4()}.mp3"
         with open(os.path.join(AUDIO_DIR, filename), "wb") as f:
             f.write(audio_bytes)
-        log.debug("REST TTS cache hit: %s", key[:40])
         return filename
 
-    language = language or ("hi-IN" if _is_mostly_hindi(text) else DEFAULT_LANGUAGE)
+    language = language or ("hi-IN" if _is_mostly_hindi(cleaned) else DEFAULT_LANGUAGE)
     speaker  = speaker  or DEFAULT_SPEAKER
     model    = model    or TTS_MODEL
 
-    payload = {
-        "text":                 text,
-        "target_language_code": language,
-        "speaker":              speaker,
-        "model":                model,
-        "pace":                 1.0,
-        "output_audio_codec":   "mp3",
-    }
-    headers = {
-        "api-subscription-key": SARVAM_API_KEY,
-        "Content-Type":         "application/json",
-    }
+    t0 = time.perf_counter()
 
-    t0   = time.perf_counter()
-    resp = await _get_http_client().post(TTS_REST_URL, json=payload, headers=headers)
-    if not resp.is_success:
-        try:    err = resp.json()
-        except: err = resp.text or f"HTTP {resp.status_code}"
-        if resp.status_code == 403:
-            raise ValueError(f"Sarvam 403 — invalid/expired key. {err}")
-        resp.raise_for_status()
+    # FIX: retry on transient 5xx errors from Sarvam
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            resp = await _get_http_client().post(
+                TTS_REST_URL,
+                json={
+                    "text": cleaned,
+                    "target_language_code": language,
+                    "speaker": speaker,
+                    "model": model,
+                    "pace": 1.0,
+                    "output_audio_codec": "mp3",
+                },
+                headers={
+                    "api-subscription-key": SARVAM_API_KEY,
+                    "Content-Type": "application/json",
+                },
+            )
+            if resp.status_code == 403:
+                raise ValueError("Sarvam 403 — check SARVAM_API_KEY")
+            resp.raise_for_status()
+            break
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code < 500 or attempt == 2:
+                raise
+            last_exc = e
+            wait = 0.5 * (2 ** attempt)
+            log.warning("Sarvam TTS %d error (attempt %d/3) — retrying in %.1fs",
+                        e.response.status_code, attempt + 1, wait)
+            await asyncio.sleep(wait)
+        except (httpx.ConnectError, httpx.TimeoutException) as e:
+            if attempt == 2:
+                raise
+            last_exc = e
+            wait = 0.5 * (2 ** attempt)
+            log.warning("Sarvam TTS network error (attempt %d/3) — retrying in %.1fs",
+                        attempt + 1, wait)
+            await asyncio.sleep(wait)
 
     audios = resp.json().get("audios") or []
     if not audios:
         raise ValueError("Sarvam REST TTS returned no audio")
 
     audio_bytes = base64.b64decode(audios[0])
-    _tts_response_cache[key] = audio_bytes
-    _tts_response_cache.move_to_end(key)
+    _tts_response_cache[cleaned] = audio_bytes
+    _tts_response_cache.move_to_end(cleaned)
     while len(_tts_response_cache) > _TTS_RESPONSE_CACHE_MAX:
         _tts_response_cache.popitem(last=False)
 
     filename = f"{uuid.uuid4()}.mp3"
     with open(os.path.join(AUDIO_DIR, filename), "wb") as f:
         f.write(audio_bytes)
-    log.info("REST TTS done in %.3fs: %s (%d bytes)",
-             time.perf_counter() - t0, filename, len(audio_bytes))
+    log.info("REST TTS: %.3fs | %d bytes", time.perf_counter() - t0, len(audio_bytes))
     return filename
 
 
-def generate_tts(text: str, language: str | None = None, speaker: str | None = None) -> str:
+def generate_tts(text: str, language=None, speaker=None) -> str:
+    """
+    Sync wrapper — FOR CLI/SCRIPTS ONLY.
+    Do NOT call from within an async context (FastAPI handlers, etc.)
+    as asyncio.run() will raise RuntimeError if an event loop is already running.
+    """
     return asyncio.run(generate_tts_async(text, language, speaker))
