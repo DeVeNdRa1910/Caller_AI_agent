@@ -47,12 +47,13 @@ from twilio.rest import Client
 from tts import (
     generate_tts_async,
     synthesise_text,
+    synthesise_text_bytes,
     llm_to_tts_stream,
     close_http_client,
     warmup_ws,
     AUDIO_DIR,
 )
-from media_stream import handle_media_stream
+from media_stream import handle_media_stream, set_thinking_filler_mp3
 from rag_pipeline import (
     rag_startup,
     retrieve_context,
@@ -87,8 +88,9 @@ log = logging.getLogger(__name__)
 app         = FastAPI(title="Multi-Tenant Voice AI Pipeline")
 groq_client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
 
-GROQ_MODEL    = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
+GROQ_MODEL      = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+GROQ_MAX_TOKENS = int(os.getenv("GROQ_MAX_TOKENS", "300"))
+ADMIN_API_KEY   = os.getenv("ADMIN_API_KEY", "")
 
 _call_history:    dict[str, list[dict]] = {}
 _call_tenant_map: dict[str, str]        = {}
@@ -134,69 +136,50 @@ class UploadTextRequest(BaseModel):
 # This prompt is placed AFTER the knowledge base in the final prompt —
 # knowledge base always comes first so LLM gives it highest weight.
 
-BASE_SYSTEM_PROMPT = """You are {agent_name}, a sales agent on a LIVE PHONE CALL.
-Everything you know is ONLY from the Knowledge Base (KB).
+BASE_SYSTEM_PROMPT = """You are {agent_name}, an AI voice agent on a LIVE PHONE CALL.
 
-═══ LANGUAGE ═══
-Reply in ROMANIZED HINGLISH (English letters, Hindi-English mix).
-NEVER output Devanagari characters. Output MUST be Roman script only.
+=== ABSOLUTE RULES ===
 
-═══ CONVERSATION FLOW ═══
-Follow these steps in order. Pick ALL details (company name, service, questions, next steps) from the KB.
+LANGUAGE:
+Write ALL responses in pure Hindi using Devanagari script.
+NEVER use Roman/English letters for Hindi words.
+  CORRECT: "ठीक है, आपका घर 5वें floor पर है।"
+  WRONG:   "Theek hai, aapka ghar 5th floor par hai."
+English technical terms (floor number, BHK, WhatsApp, email, etc.) may stay
+in English within the Hindi sentence — everything else must be Devanagari.
 
-STEP 1 — GREETING + LANGUAGE PREFERENCE:
-  OUTBOUND: Already done. DO NOT repeat.
-  INBOUND: Introduce yourself with your name and company name from KB. Ask language preference.
+LENGTH:
+अधिकतम 2 छोटे वाक्य प्रति उत्तर। यह एक live phone call है।
+कभी भी list, bullet, number या markdown का उपयोग न करें।
 
-STEP 2 — STATE REASON + CHECK GOOD TIME:
-  Tell the user why you are calling (use the service/product from KB).
-  Ask if this is a good time to talk.
-  If NO → ask when to call back → confirm the time → end.
-  If YES → go to Step 3.
+DATA INTEGRITY — CRITICAL:
+- कभी भी ऐसी कोई जानकारी assume, guess या fill in न करें जो customer ने explicitly नहीं बताई।
+- केवल वही facts mention करें जो customer ने इस conversation में confirm किए हों।
+- जब संदेह हो: पूछें — कभी assume या invent न करें।
 
-STEP 3 — CONFIRM THE NEED:
-  Confirm with the user that they need the service/product described in KB.
-  Wait for yes/no.
+=== YOUR ROLE ===
+ALL information (company name, services, call flow steps, required details)
+comes ONLY from the Knowledge Base (KB). Do not invent any business information.
+If something is not in the KB, say: "मैं टीम से confirm करके आपको बताऊंगी।"
 
-STEP 4 — COLLECT INFORMATION:
-  Collect details the KB says are needed.
-  Ask in LOGICAL GROUPS (2-3 related questions per turn).
-  Wait for answers before asking the next group.
-  Continue until all KB-required info is collected.
-
-STEP 5 — NEXT STEPS:
-  Offer whatever next steps the KB describes (quotation, callback, demo, etc.).
-  Ask the user's preference on how to receive it.
-
-STEP 6 — SCHEDULE (if KB mentions any scheduling like survey/visit/demo):
-  Schedule it. Ask for convenient time and any other details needed.
-
-STEP 7 — WRAP UP:
-  Thank them, confirm what happens next, end politely.
-
-═══ RESPONDING TO THE USER ═══
-CRITICAL: Always respond to what the user ACTUALLY said FIRST.
-- If user asks to repeat / says "phir se bolo" / "dobara bolo" / "kya bola" → REPEAT your last question.
-- If user asks a question → ANSWER it first, then continue the flow.
-- If user says something unclear → Politely ask them to repeat.
-- If user gives a partial answer → Acknowledge it, then ask the remaining part.
-- ONLY move to the next step AFTER the user has fully answered the current question.
-
-═══ RULES ═══
-- 1-2 short sentences per reply MAX. This is a phone call.
-- NEVER echo back what the customer said. Just move forward.
-- NEVER re-ask something already answered. Check conversation history.
-- NEVER make up info not in KB. Say you will confirm with the team.
-- NEVER use bullets, lists, or markdown.
-- ALWAYS pronounce {agent_name} as one word.
+=== HOW TO HANDLE THE CALL ===
+The KB contains a CALL FLOW section with numbered steps specific to this tenant.
+Follow those steps IN ORDER, one step at a time.
+- OUTBOUND: The opening greeting has already been played. Do NOT repeat it.
+- INBOUND: Introduce yourself using agent name and company name from KB. Ask language preference.
+- Check conversation history to know which step you are currently on.
+- Ask ONLY the current step's question. Move forward ONLY after the customer answers.
+- Never re-ask an already answered question. Never skip ahead.
+- If the customer asks a question mid-flow, answer briefly from KB, then return to the current step.
 """
 
 # ── Fixed responses & opening ──────────────────────────────────────────────────
 
 FIXED_RESPONSES: dict[str, str] = {
-    "unclear_hi":   "Sorry, clear nahi sun paayi. Aap dobara bol sakte hai?",
+    "unclear_hi":   "माफ़ कीजिए, मुझे सुनाई नहीं दिया। क्या आप दोबारा बोल सकते हैं?",
     "unclear_en":   "Sorry, I didn't catch that. Could you please repeat?",
-    "unclear_both": "Sorry, clear nahi hua. Aap ek baar aur bol dijiye?",
+    "unclear_both": "माफ़ कीजिए, ठीक से सुनाई नहीं दिया। एक बार और बोलिए।",
+    "thinking_hi":  "जी, एक moment।",
 }
 
 # ── Auth helpers ───────────────────────────────────────────────────────────────
@@ -273,6 +256,20 @@ async def _rerender_bg(text: str):
 
 async def _prerender_all():
     await asyncio.gather(*[_render_one(k, t) for k, t in FIXED_RESPONSES.items()])
+    # Separately set the thinking filler (needs MP3 bytes, not just a filename)
+    await _init_thinking_filler()
+
+
+async def _init_thinking_filler():
+    text = FIXED_RESPONSES["thinking_hi"]
+    try:
+        mp3 = await synthesise_text_bytes(text)
+        if mp3:
+            await set_thinking_filler_mp3(mp3)
+        else:
+            log.warning("  ❌ [thinking_hi] synthesis returned empty")
+    except Exception as e:
+        log.warning("  ❌ [thinking_hi] failed: %s", e)
 
 
 async def _render_one(key: str, text: str):
@@ -290,7 +287,7 @@ async def _stream_llm_sentences(messages: list[dict]):
     stream = await groq_client.chat.completions.create(
         model=GROQ_MODEL,
         messages=messages,
-        max_tokens=128,
+        max_tokens=GROQ_MAX_TOKENS,
         temperature=0.1,
         stream=True,
         tool_choice="none",
@@ -329,7 +326,7 @@ async def _run_pipeline(
     if not sentences:
         stream = await groq_client.chat.completions.create(
             model=GROQ_MODEL, messages=messages,
-            max_tokens=128, temperature=0.1, stream=True, tool_choice="none",
+            max_tokens=GROQ_MAX_TOKENS, temperature=0.1, stream=True, tool_choice="none",
         )
         fn, ai_reply = await llm_to_tts_stream(stream)
         ai_reply     = ai_reply.strip() or "Sorry, clear nahi sun paayi. Aap dobara bol sakte hai?"
@@ -462,7 +459,7 @@ async def _handle_voice(form_like, tenant_id: str | None = None) -> Response:
                 )
 
             messages = [{"role": "system", "content": system_prompt}]
-            for msg in history[-6:]:
+            for msg in history[-20:]:
                 messages.append(msg)
             messages.append({"role": "user", "content": user_input})
 

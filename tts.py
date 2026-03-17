@@ -52,7 +52,7 @@ DEFAULT_SPEAKER  = TTS_SPEAKER
 DEFAULT_LANGUAGE = "hi-IN"
 
 _SENTENCE_END   = re.compile(r"[।.?!\n]")
-_SOFT_FLUSH_LEN = 15
+_SOFT_FLUSH_LEN = 50
 _PING_INTERVAL  = 25
 
 _TTS_RESPONSE_CACHE_MAX = 50
@@ -303,32 +303,30 @@ class _PersistentWsConn:
 
     async def _do_synthesise_stream_chunks(self, groq_stream):
         """
-        NEW STREAMING GENERATOR.
+        Per-sentence streaming generator.
 
-        Three concurrent tasks:
-          A. _drain_llm     — reads LLM tokens, puts them in token_queue
-          B. _send_to_ws    — reads token_queue, batches into sentences,
-                              sends text+flush messages to Sarvam WS
-          C. This generator — reads Sarvam WS, yields each MP3 chunk
-                              immediately as it arrives
+        For each sentence from the LLM:
+          1. Send text + flush to Sarvam WS
+          2. Collect all audio events until the completion event
+          3. Join those bytes → one valid MP3 for that sentence
+             (Sarvam audio events within a single flush are sequential MP3
+              frames of one continuous synthesis — joining them is correct)
+          4. Yield that MP3 immediately to the caller
+
+        This gives both low latency (first sentence ~0.8s) and clean audio
+        (no boundary crackling — each yielded chunk is a complete MP3).
 
         Timeline:
-          t=0.0  LLM first token arrives
-          t=0.3  First sentence buffered, flushed to Sarvam WS
-          t=0.8  Sarvam returns first audio chunk → yielded to caller → Twilio
-          t=1.0  LLM finishes, second sentence flushed
-          t=1.5  Second audio chunk yielded → Twilio
-          (first sentence audio already playing at t=0.8)
-
-        Falls back to REST if WS is unavailable.
+          t=0.0  LLM first token
+          t=0.3  First sentence boundary → flush to Sarvam
+          t=0.8  Sarvam completion event → yield sentence-1 MP3 → Twilio plays
+          t=0.4  Second sentence ready → flush → audio → yield → Twilio
         """
         t_total   = time.perf_counter()
         full_text = ""
         token_queue: asyncio.Queue[str | None] = asyncio.Queue()
-        # Audio queue: bytes = chunk, None = done, Exception = error
-        audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
 
-        # ── Task A: drain LLM tokens into token_queue ──────────────────────
+        # Task A: drain LLM tokens into queue in background
         async def _drain_llm():
             nonlocal full_text
             first = True
@@ -343,102 +341,106 @@ class _PersistentWsConn:
                         log.info("⏱  LLM first token: %.3fs", time.perf_counter() - t_total)
                         first = False
             finally:
-                await token_queue.put(None)  # sentinel
+                await token_queue.put(None)
             log.info("⏱  LLM done: %.3fs | %r", time.perf_counter() - t_total, full_text[:80])
 
-        # ── Task B: send batched text to Sarvam WS ─────────────────────────
-        async def _send_to_ws():
-            buf = ""
-            try:
-                while True:
-                    token = await token_queue.get()
-                    if token is None:
-                        break
-                    buf += token
-                    # Flush on sentence boundary OR buffer length
-                    if _SENTENCE_END.search(buf) or len(buf) >= _SOFT_FLUSH_LEN:
-                        chunk_text = buf.strip()
-                        buf = ""
-                        if chunk_text:
-                            await self._ws.send(json.dumps({
-                                "type": "text",
-                                "data": {"text": chunk_text},
-                            }))
-                if buf.strip():
-                    await self._ws.send(json.dumps({
-                        "type": "text",
-                        "data": {"text": buf.strip()},
-                    }))
-                # Final flush tells Sarvam to send remaining audio + completion event
-                await self._ws.send(json.dumps({"type": "flush"}))
-                log.info("⏱  WS all text flushed: %.3fs", time.perf_counter() - t_total)
-            except Exception as e:
-                log.warning("_send_to_ws error: %s", e)
-                await audio_queue.put(e)  # signal error to receiver
-
-        # ── Task C (inline): receive audio chunks from Sarvam WS ───────────
         ws_ok = await self._ensure_ws()
 
-        if ws_ok:
+        if not ws_ok:
+            # No WS — drain LLM then REST fallback
+            llm_task = asyncio.create_task(_drain_llm())
+            await llm_task
+            full_text = full_text.strip() or "Sorry, main samajh nahi payi."
             try:
-                llm_task  = asyncio.create_task(_drain_llm())
-                send_task = asyncio.create_task(_send_to_ws())
-                first_chunk = True
+                fname = await generate_tts_async(full_text, self.language, self.speaker)
+                filepath = os.path.join(AUDIO_DIR, fname)
+                with open(filepath, "rb") as f:
+                    data = f.read()
+                yield data
+            except Exception as e:
+                log.warning("REST TTS fallback failed: %s", e)
+            return
 
-                async for msg in self._ws:
-                    data     = json.loads(msg)
-                    msg_type = data.get("type")
+        llm_task    = asyncio.create_task(_drain_llm())
+        buf         = ""
+        first_audio = True
+        ws_error    = False
 
-                    if msg_type == "audio":
-                        b64 = (data.get("data") or {}).get("audio") or ""
-                        if b64:
-                            chunk_bytes = base64.b64decode(b64)
-                            if first_chunk:
-                                log.info("⏱  First audio chunk: %.3fs",
-                                         time.perf_counter() - t_total)
-                                first_chunk = False
-                            yield chunk_bytes   # ← caller gets this immediately
-
-                    elif msg_type == "event":
-                        log.info("⏱  TTS stream complete: %.3fs",
-                                 time.perf_counter() - t_total)
-                        break
-
-                    elif msg_type == "error":
-                        raise RuntimeError(f"Sarvam WS error: {data}")
-
-                # Wait for LLM and send tasks to finish cleanly
-                await asyncio.gather(llm_task, send_task, return_exceptions=True)
-                return  # successfully streamed everything
-
-            except (ConnectionClosed, WebSocketException, OSError, RuntimeError) as e:
-                log.warning("WS stream chunk error: %s — REST fallback", e)
-                self._ws = None
-                self._config_sent = False
-                # Drain token_queue so _drain_llm doesn't hang
-                while not token_queue.empty():
-                    token_queue.get_nowait()
-
-        # ── REST fallback: collect full_text then synthesise once ───────────
-        log.info("Streaming REST fallback for: %r", full_text[:60])
-        # Drain remaining LLM tokens if WS path failed mid-stream
-        if not full_text:
-            try:
-                async for chunk in groq_stream:
-                    token = (chunk.choices[0].delta.content or "") if chunk.choices else ""
-                    full_text += token
-            except Exception:
-                pass
-
-        full_text = full_text.strip() or "Sorry, main samajh nahi payi."
         try:
-            fname    = await generate_tts_async(full_text, self.language, self.speaker)
-            filepath = os.path.join(AUDIO_DIR, fname)
-            with open(filepath, "rb") as f:
-                data = f.read()
-            yield data   # yield the whole thing as one chunk
-        except Exception as e:
-            log.warning("REST TTS fallback also failed: %s", e)
+            while True:
+                token         = await token_queue.get()
+                end_of_stream = (token is None)
+
+                if not end_of_stream:
+                    buf += token
+                    # Keep buffering until sentence boundary or soft-flush threshold
+                    if not (_SENTENCE_END.search(buf) or len(buf) >= _SOFT_FLUSH_LEN):
+                        continue
+
+                flush_text = buf.strip()
+                buf = ""
+
+                if flush_text:
+                    # Send sentence + flush, then collect all audio for this flush
+                    await self._ws.send(json.dumps({
+                        "type": "text",
+                        "data": {"text": flush_text},
+                    }))
+                    await self._ws.send(json.dumps({"type": "flush"}))
+                    log.info("⏱  WS sentence flushed (%d chars): %.3fs",
+                             len(flush_text), time.perf_counter() - t_total)
+
+                    audio_chunks: list[bytes] = []
+                    async for msg in self._ws:
+                        data     = json.loads(msg)
+                        msg_type = data.get("type")
+                        if msg_type == "audio":
+                            b64 = (data.get("data") or {}).get("audio") or ""
+                            if b64:
+                                if not audio_chunks and first_audio:
+                                    log.info("⏱  First audio chunk: %.3fs",
+                                             time.perf_counter() - t_total)
+                                    first_audio = False
+                                audio_chunks.append(base64.b64decode(b64))
+                        elif msg_type == "event":
+                            log.info("⏱  Sentence audio complete: %.3fs",
+                                     time.perf_counter() - t_total)
+                            break
+                        elif msg_type == "error":
+                            raise RuntimeError(f"Sarvam WS error: {data}")
+
+                    if audio_chunks:
+                        # All audio events for one flush = sequential MP3 frames
+                        # of a single synthesis → joining them gives one valid MP3
+                        yield b"".join(audio_chunks)
+
+                if end_of_stream:
+                    break
+
+            log.info("⏱  TTS stream complete: %.3fs", time.perf_counter() - t_total)
+
+        except (ConnectionClosed, WebSocketException, OSError, RuntimeError) as e:
+            log.warning("WS stream chunk error: %s — REST fallback", e)
+            self._ws = None
+            self._config_sent = False
+            ws_error = True
+            while not token_queue.empty():
+                token_queue.get_nowait()
+
+        await asyncio.gather(llm_task, return_exceptions=True)
+
+        # REST fallback only if WS failed before any audio was yielded
+        if ws_error and first_audio:
+            log.info("Streaming REST fallback for: %r", full_text[:60])
+            full_text = full_text.strip() or "Sorry, main samajh nahi payi."
+            try:
+                fname    = await generate_tts_async(full_text, self.language, self.speaker)
+                filepath = os.path.join(AUDIO_DIR, fname)
+                with open(filepath, "rb") as f:
+                    data = f.read()
+                yield data
+            except Exception as e:
+                log.warning("REST TTS fallback also failed: %s", e)
 
     async def synthesise_to_bytes(self, text: str) -> bytes | None:
         cleaned = text.strip()

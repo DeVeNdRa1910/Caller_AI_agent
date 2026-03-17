@@ -55,38 +55,56 @@ MIN_SILENCE_MS       = 500
 MAX_RECORD_MS        = 10000
 POST_TTS_COOLDOWN_MS = 600
 
-_MAX_HISTORY_TURNS = 20
+_MAX_HISTORY_TURNS = 30
+GROQ_MAX_TOKENS    = int(os.getenv("GROQ_MAX_TOKENS", "350"))
 
-AGENT_BEHAVIOUR_PROMPT = """=== SCRIPT RULES — READ THIS FIRST ===
+# Pre-decoded 8kHz mulaw bytes for the "thinking" filler phrase played when
+# the Groq API is slow (e.g. 429 retry delays).  Set at startup via
+# set_thinking_filler_mp3().
+_thinking_filler_mulaw: bytes | None = None
 
-LANGUAGE — ABSOLUTE RULE:
-You MUST write every single word in ROMAN SCRIPT (English letters).
-NEVER output Devanagari, Gujarati, or any non-Latin characters.
-Hinglish example: write "Theek hai, aapka ghar 2nd floor par hai."
-NOT: "ठीक है, आपका घर 2nd floor पर है।"
-Roman script only — Devanagari output breaks the voice system.
 
-LENGTH — ABSOLUTE RULE:
-Maximum 2 short sentences per reply. This is a live phone call.
-Never write more than 2 sentences. No lists, bullets, or markdown.
+async def set_thinking_filler_mp3(mp3: bytes) -> None:
+    """Accept raw MP3 bytes, convert to 8kHz mulaw, store as thinking filler."""
+    global _thinking_filler_mulaw
+    _thinking_filler_mulaw = await asyncio.to_thread(_mp3_chunk_to_mulaw_8k, mp3)
+    log.info("Thinking filler ready: %d mulaw bytes", len(_thinking_filler_mulaw))
+
+
+AGENT_BEHAVIOUR_PROMPT = """=== ABSOLUTE RULES — MUST FOLLOW AT ALL TIMES ===
+
+LANGUAGE:
+Write ALL responses in pure Hindi using Devanagari script.
+NEVER use Roman/English letters for Hindi words.
+  CORRECT: "ठीक है, आपका घर 5वें floor पर है।"
+  WRONG:   "Theek hai, aapka ghar 5th floor par hai."
+English technical terms (floor number, BHK, WhatsApp, email, etc.) may stay
+in English within the Hindi sentence — everything else must be Devanagari.
+
+LENGTH:
+अधिकतम 2 छोटे वाक्य प्रति उत्तर। यह एक live phone call है।
+कभी भी list, bullet, number या markdown का उपयोग न करें।
+
+DATA INTEGRITY — CRITICAL:
+- कभी भी ऐसी कोई जानकारी assume, guess या fill in न करें जो customer ने explicitly नहीं बताई।
+- केवल वही facts mention करें जो customer ने इस conversation में confirm किए हों।
+- जब संदेह हो: पूछें — कभी assume या invent न करें।
 
 === YOUR ROLE ===
 You are an AI voice agent on a LIVE OUTBOUND PHONE CALL.
-All knowledge about this company, its services, and the call flow
-comes ONLY from the Knowledge Base (KB) provided below.
-You have no other knowledge. Do not invent information.
-If something is not in the KB, say: "Main team se confirm karke bataungi."
+ALL information (company name, services, call flow steps, required details)
+comes ONLY from the Knowledge Base (KB). Never invent any business information.
+If something is not in the KB, say: "मैं टीम से confirm करके आपको बताऊंगी।"
 
-=== CALL FLOW ===
-The KB contains a section called "Mandatory Call Flow" with numbered steps.
-Follow those steps IN ORDER. One step at a time.
-- Check conversation history to know your current step.
-- Ask ONLY the current step's question.
-- Move to the next step ONLY after the customer answers the current one.
-- NEVER re-ask an already answered question.
-- NEVER repeat the opening greeting — it was already spoken.
-- If unclear, ask the customer to repeat ONCE.
-- If asked a question mid-flow, answer briefly from KB then return to current step.
+=== HOW TO HANDLE THE CALL ===
+The KB contains a CALL FLOW section with numbered steps specific to this tenant.
+Follow those steps IN ORDER, one step at a time.
+- The opening greeting has already been played before this conversation started.
+- Customer's first reply is their answer to the language preference question in the greeting.
+- Check conversation history to know which step you are currently on.
+- Ask ONLY the current step's question. Move forward ONLY after the customer answers.
+- Never re-ask an already answered question. Never skip ahead.
+- If the customer asks a question mid-flow, answer briefly from KB, then return to the current step.
 """
 
 
@@ -112,6 +130,28 @@ def _pcm_to_wav_bytes(pcm: bytes, sample_rate: int = 8000) -> bytes:
 def _mp3_chunk_to_mulaw_8k(mp3_bytes: bytes) -> bytes:
     from pydub import AudioSegment
     seg = AudioSegment.from_mp3(io.BytesIO(mp3_bytes))
+    seg = seg.set_frame_rate(8000).set_channels(1)
+    return audioop.lin2ulaw(seg.raw_data, 2)
+
+
+def _mp3_chunks_to_mulaw_8k(mp3_chunks: list) -> bytes:
+    """
+    Decode each MP3 chunk as a self-contained audio segment, concatenate the
+    decoded PCM, then convert to 8kHz mulaw.
+
+    Each Sarvam TTS audio event is a complete MP3 file.  Joining raw MP3 bytes
+    with b"".join() produces invalid audio because ffmpeg can only parse the
+    first file's header.  Decoding each chunk independently and concatenating
+    PCM avoids the header conflict and eliminates inter-chunk boundary
+    artifacts (silence padding / click at segment start/end).
+    """
+    from pydub import AudioSegment
+    if len(mp3_chunks) == 1:
+        seg = AudioSegment.from_mp3(io.BytesIO(mp3_chunks[0]))
+    else:
+        seg = AudioSegment.empty()
+        for chunk in mp3_chunks:
+            seg += AudioSegment.from_mp3(io.BytesIO(chunk))
     seg = seg.set_frame_rate(8000).set_channels(1)
     return audioop.lin2ulaw(seg.raw_data, 2)
 
@@ -308,28 +348,36 @@ class MediaStreamHandler:
             context  = ""
 
             if self.tenant_id:
+                # Always append the generic "call flow steps" anchor so the KB CALL FLOW
+                # section is retrieved on every turn regardless of the user's exact words.
+                # No tenant-specific keywords are used here — the KB itself contains the
+                # domain-specific content.
                 rag_query = (
-                    "mandatory call flow steps language greeting good time "
-                    "confirm service household floor lift vehicle quotation survey address"
-                    if is_first else user_text
+                    "call flow steps"
+                    if is_first else
+                    f"{user_text} call flow steps"
                 )
                 context = await retrieve_context(
                     self.tenant_id, rag_query,
-                    top_k=15 if is_first else 8,
+                    top_k=15 if is_first else 10,
                     max_chars=4000,
                 )
                 log.info("RAG: %d chars", len(context)) if context else \
                 log.warning("RAG: NO context for tenant=%s", self.tenant_id)
 
             # 4. System prompt
-            system_prompt = build_rag_system_prompt(AGENT_BEHAVIOUR_PROMPT, context)
+            # Use the tenant-specific prompt loaded from _get_base_prompt()
+            # (respects system_prompt_override if set), falling back to the
+            # universal AGENT_BEHAVIOUR_PROMPT.
+            base_prompt   = (self.system_prompt or "").strip() or AGENT_BEHAVIOUR_PROMPT
+            system_prompt = build_rag_system_prompt(base_prompt, context)
             system_prompt += (
-                "\n\n[CALL STATE: Opening greeting already spoken. "
-                "Customer responding to language preference. "
-                "You are on Step 1. Do NOT greet again.]"
+                "\n\n[CALL STATE: Outbound call. The opening greeting has already been"
+                " played and the customer is responding to it now. Do NOT greet again."
+                " Proceed with the first unanswered step in the KB CALL FLOW.]"
                 if is_first else
-                "\n\n[CALL STATE: Call in progress. "
-                "Check conversation history for current step. Continue from that step only.]"
+                "\n\n[CALL STATE: Call in progress."
+                " Check conversation history to identify the current step and continue from there.]"
             )
 
             # 5. LLM — stream=True
@@ -339,14 +387,26 @@ class MediaStreamHandler:
             messages.append({"role": "user", "content": user_text})
 
             t_llm = time.perf_counter()
-            groq_stream = await self.groq_client.chat.completions.create(
-                model       = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"),
-                messages    = messages,
-                max_tokens  = 80,
-                temperature = 0.0,
-                stream      = True,
-                tool_choice = "none",
+            # Start thinking filler — fires after 2.5s if Groq hasn't responded
+            # (e.g. during 429 retry backoff).  Cancelled the moment create() returns.
+            _filler_task = asyncio.create_task(
+                self._stream_thinking_filler(ws, delay_s=2.5)
             )
+            try:
+                groq_stream = await self.groq_client.chat.completions.create(
+                    model       = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"),
+                    messages    = messages,
+                    max_tokens  = GROQ_MAX_TOKENS,
+                    temperature = 0.0,
+                    stream      = True,
+                    tool_choice = "none",
+                )
+            finally:
+                _filler_task.cancel()
+                try:
+                    await _filler_task
+                except asyncio.CancelledError:
+                    pass
             log.info("⏱  LLM stream started: %.3fs", time.perf_counter() - t_llm)
 
             # 6. Stream LLM tokens → TTS → Twilio simultaneously
@@ -354,18 +414,35 @@ class MediaStreamHandler:
             # llm_to_tts_stream_chunks() yields MP3 chunks as Sarvam produces them.
             # We convert and send each chunk to Twilio without waiting for the full response.
             # User hears first audio ~0.8s after LLM starts, not after it finishes.
+            #
+            # We also wrap the stream in a capturing generator so we can save the
+            # exact text that was spoken to the user into history — no second LLM
+            # call required (eliminates the 429 rate-limit history corruption bug).
+
+            captured_tokens: list[str] = []
+
+            async def _capturing_stream(stream):
+                async for chunk in stream:
+                    if chunk.choices:
+                        token = chunk.choices[0].delta.content or ""
+                        if token:
+                            captured_tokens.append(token)
+                    yield chunk
 
             total_bytes = 0
             first_chunk = True
             ws_failed   = False
 
-            async for mp3_chunk in llm_to_tts_stream_chunks(groq_stream):
+            async for mp3_chunk in llm_to_tts_stream_chunks(_capturing_stream(groq_stream)):
                 if first_chunk:
                     log.info("⏱  First audio chunk: %.3fs", time.perf_counter() - t0)
                     first_chunk = False
 
                 total_bytes += len(mp3_chunk)
 
+                # Each yielded chunk is a complete per-sentence MP3
+                # (all Sarvam audio events for one flush joined together).
+                # Decoding each independently is safe here — no crackling.
                 try:
                     mulaw = await asyncio.to_thread(_mp3_chunk_to_mulaw_8k, mp3_chunk)
                 except Exception as e:
@@ -384,7 +461,7 @@ class MediaStreamHandler:
                         log.warning("Twilio WS send failed: %s", e)
                         ws_failed = True
                         break
-                    await asyncio.sleep(0.005)
+                    await asyncio.sleep(0)  # yield to event loop, no real delay
 
                 if ws_failed:
                     break
@@ -396,8 +473,9 @@ class MediaStreamHandler:
             log.info("⏱  Total pipeline: %.3fs | audio: %d bytes",
                      time.perf_counter() - t0, total_bytes)
 
-            # 8. Record reply in history (non-streaming call, runs after audio sent)
-            ai_reply = await self._get_reply_for_history(messages)
+            # 8. Record reply in history using the text captured directly from the
+            # streamed LLM output — no second Groq call, no 429 corruption risk.
+            ai_reply = "".join(captured_tokens).strip() or "[streamed response]"
             log.info("🤖 AGENT: %s", ai_reply)
 
             if self.call_sid and ai_reply:
@@ -417,24 +495,27 @@ class MediaStreamHandler:
             self._cooldown_until_ms = time.monotonic() * 1000 + self._extra_cooldown_ms
             self._ready_event.set()
 
-    async def _get_reply_for_history(self, messages: list) -> str:
+    async def _stream_thinking_filler(self, ws: WebSocket, delay_s: float = 2.5):
         """
-        Small non-streaming LLM call to get the text reply for conversation history.
-        Runs AFTER audio is already streamed to user so it doesn't add latency.
+        After delay_s seconds of silence, stream the pre-cached 'thinking' filler
+        audio to the caller so they know the agent is still processing.
+        Cancelled immediately when the real Groq response arrives.
         """
-        try:
-            resp = await self.groq_client.chat.completions.create(
-                model       = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"),
-                messages    = messages,
-                max_tokens  = 80,
-                temperature = 0.0,
-                stream      = False,
-                tool_choice = "none",
-            )
-            return (resp.choices[0].message.content or "").strip()
-        except Exception as e:
-            log.warning("History LLM call failed: %s", e)
-            return "[streamed response]"
+        await asyncio.sleep(delay_s)
+        if _thinking_filler_mulaw is None:
+            return
+        log.info("⏳ Groq slow (>%.1fs) — playing thinking filler", delay_s)
+        for i in range(0, len(_thinking_filler_mulaw), 160):
+            b64 = base64.b64encode(_thinking_filler_mulaw[i: i + 160]).decode("ascii")
+            try:
+                await ws.send_text(json.dumps({
+                    "event":     "media",
+                    "streamSid": self.stream_sid,
+                    "media":     {"payload": b64},
+                }))
+            except Exception:
+                break
+            await asyncio.sleep(0)
 
     async def _send_error_tts(self, ws: WebSocket):
         text = "Sorry, ek technical issue aa gaya. Ek moment please."
