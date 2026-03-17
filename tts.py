@@ -1,16 +1,23 @@
 """
 tts.py — Persistent WebSocket TTS with keepalive pings.
 
-FIXES IN THIS VERSION:
-  1. synthesise_to_bytes: empty/whitespace key collision fixed — empty text
-     now returns None immediately instead of caching under key " " which
-     caused all empty inputs to collide to the same cache entry.
-  2. _do_synthesise_stream: replaced 1ms spin-wait with asyncio.Queue so the
-     LLM token producer and WS sender are properly decoupled without burning
-     CPU on tight-loop sleeps.
-  3. keepalive ping no longer acquires _lock (which blocked when synthesis was
-     running, causing WS timeout and reconnect mid-call). Ping uses _ping_lock.
-  4. synthesise_to_bytes goes directly to REST cache path — no WS lock contention.
+NEW IN THIS VERSION:
+  synthesise_stream_chunks() — async generator that yields MP3 audio chunks
+  as they arrive from the Sarvam WebSocket while the LLM is still generating.
+  This enables true parallel LLM+TTS streaming: the first audio chunk reaches
+  Twilio before the LLM has even finished its response.
+
+  Pipeline with streaming:
+    LLM token 1 → queue → WS send → Sarvam generates → audio chunk 1 yielded
+    LLM token 2 → queue → ...      (in parallel)
+    ...
+    First audio playing on Twilio while LLM still generating last sentence.
+
+FIXES RETAINED FROM PREVIOUS VERSION:
+  1. synthesise_to_bytes: empty/whitespace key collision fixed.
+  2. _do_synthesise_stream: asyncio.Queue replaces spin-wait.
+  3. Keepalive ping uses _ping_lock, not _lock (no mid-synthesis block).
+  4. synthesise_to_bytes uses REST cache path directly.
 """
 
 import asyncio
@@ -46,7 +53,7 @@ DEFAULT_LANGUAGE = "hi-IN"
 
 _SENTENCE_END   = re.compile(r"[।.?!\n]")
 _SOFT_FLUSH_LEN = 15
-_PING_INTERVAL  = 25   # send ping every 25s (well under Sarvam's 60s idle timeout)
+_PING_INTERVAL  = 25
 
 _TTS_RESPONSE_CACHE_MAX = 50
 _tts_response_cache: OrderedDict[str, bytes] = OrderedDict()
@@ -77,8 +84,8 @@ class _PersistentWsConn:
         self.language     = language
         self.speaker      = speaker
         self._ws          = None
-        self._lock        = asyncio.Lock()   # guards synthesis only (NOT keepalive)
-        self._ping_lock   = asyncio.Lock()   # guards ping write only
+        self._lock        = asyncio.Lock()
+        self._ping_lock   = asyncio.Lock()
         self._keepalive_task: asyncio.Task | None = None
         self._config_sent = False
 
@@ -96,6 +103,25 @@ class _PersistentWsConn:
         async with asyncio.timeout(25):
             async with self._lock:
                 return await self._do_synthesise_stream(groq_stream)
+
+    async def synthesise_stream_chunks(self, groq_stream):
+        """
+        NEW: Async generator that yields raw MP3 bytes chunks as they arrive
+        from the Sarvam WebSocket, while the LLM is still generating tokens.
+
+        Usage:
+            async for mp3_chunk in conn.synthesise_stream_chunks(groq_stream):
+                await stream_to_twilio(mp3_chunk)
+
+        This is the true low-latency path:
+          - LLM tokens → asyncio.Queue → WS send → Sarvam audio → yield chunk
+          - Caller receives and streams first audio chunk in ~0.8-1s
+          - Subsequent chunks arrive while first chunk is already playing
+        """
+        async with asyncio.timeout(30):
+            async with self._lock:
+                async for chunk in self._do_synthesise_stream_chunks(groq_stream):
+                    yield chunk
 
     async def close(self):
         if self._keepalive_task:
@@ -146,10 +172,6 @@ class _PersistentWsConn:
         log.info("WS config sent (lang=%s speaker=%s)", self.language, self.speaker)
 
     async def _keepalive_loop(self):
-        """
-        Send ping every _PING_INTERVAL seconds.
-        Uses _ping_lock (NOT _lock) so it never blocks synthesis.
-        """
         try:
             while True:
                 await asyncio.sleep(_PING_INTERVAL)
@@ -208,12 +230,7 @@ class _PersistentWsConn:
         return fname, text
 
     async def _do_synthesise_stream(self, groq_stream) -> tuple[str, str]:
-        """
-        FIX: replaced 1ms spin-wait loop with asyncio.Queue.
-        The LLM token producer puts tokens into the queue; the WS sender
-        consumes them. This eliminates CPU waste and improves scheduling
-        fairness for other coroutines.
-        """
+        """Collect all stream audio then return — used by llm_to_tts_stream()."""
         t_total      = time.perf_counter()
         audio_chunks : list[bytes] = []
         full_text    = ""
@@ -232,7 +249,7 @@ class _PersistentWsConn:
                     log.info("⏱  LLM first token: %.3fs", time.perf_counter() - t_total)
                     first = False
             log.info("⏱  LLM done: %.3fs | %s", time.perf_counter() - t_total, full_text[:60])
-            await token_queue.put(None)  # sentinel
+            await token_queue.put(None)
 
         llm_task = asyncio.create_task(_drain_llm())
         ws_ok    = await self._ensure_ws()
@@ -242,22 +259,15 @@ class _PersistentWsConn:
                 async def _send_from_queue():
                     buf = ""
                     while True:
-                        # FIX: await queue.get() instead of spin-waiting with sleep(0.001)
                         token = await token_queue.get()
                         if token is None:
                             break
                         buf += token
                         if _SENTENCE_END.search(buf) or len(buf) >= _SOFT_FLUSH_LEN:
-                            await self._ws.send(json.dumps({
-                                "type": "text",
-                                "data": {"text": buf.strip()}
-                            }))
+                            await self._ws.send(json.dumps({"type": "text", "data": {"text": buf.strip()}}))
                             buf = ""
                     if buf.strip():
-                        await self._ws.send(json.dumps({
-                            "type": "text",
-                            "data": {"text": buf.strip()}
-                        }))
+                        await self._ws.send(json.dumps({"type": "text", "data": {"text": buf.strip()}}))
                     await self._ws.send(json.dumps({"type": "flush"}))
                     log.info("⏱  WS flush: %.3fs", time.perf_counter() - t_total)
 
@@ -276,7 +286,7 @@ class _PersistentWsConn:
                             raise RuntimeError(f"Sarvam WS error: {data}")
 
                 await asyncio.gather(llm_task, _send_from_queue(), _recv_audio())
-                full_text = full_text.strip() or "कृपया दोबारा बोलें।"
+                full_text = full_text.strip() or "Kripya dobara bolein."
                 if audio_chunks:
                     return _save_audio(audio_chunks, full_text, t_total)
                 log.warning("WS: no audio — REST fallback")
@@ -287,19 +297,151 @@ class _PersistentWsConn:
 
         if not llm_task.done():
             await llm_task
-        full_text = full_text.strip() or "कृपया दोबारा बोलें।"
+        full_text = full_text.strip() or "Kripya dobara bolein."
         fname = await generate_tts_async(full_text, self.language, self.speaker)
         return fname, full_text
 
+    async def _do_synthesise_stream_chunks(self, groq_stream):
+        """
+        NEW STREAMING GENERATOR.
+
+        Three concurrent tasks:
+          A. _drain_llm     — reads LLM tokens, puts them in token_queue
+          B. _send_to_ws    — reads token_queue, batches into sentences,
+                              sends text+flush messages to Sarvam WS
+          C. This generator — reads Sarvam WS, yields each MP3 chunk
+                              immediately as it arrives
+
+        Timeline:
+          t=0.0  LLM first token arrives
+          t=0.3  First sentence buffered, flushed to Sarvam WS
+          t=0.8  Sarvam returns first audio chunk → yielded to caller → Twilio
+          t=1.0  LLM finishes, second sentence flushed
+          t=1.5  Second audio chunk yielded → Twilio
+          (first sentence audio already playing at t=0.8)
+
+        Falls back to REST if WS is unavailable.
+        """
+        t_total   = time.perf_counter()
+        full_text = ""
+        token_queue: asyncio.Queue[str | None] = asyncio.Queue()
+        # Audio queue: bytes = chunk, None = done, Exception = error
+        audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+
+        # ── Task A: drain LLM tokens into token_queue ──────────────────────
+        async def _drain_llm():
+            nonlocal full_text
+            first = True
+            try:
+                async for chunk in groq_stream:
+                    token = (chunk.choices[0].delta.content or "") if chunk.choices else ""
+                    if not token:
+                        continue
+                    full_text += token
+                    await token_queue.put(token)
+                    if first:
+                        log.info("⏱  LLM first token: %.3fs", time.perf_counter() - t_total)
+                        first = False
+            finally:
+                await token_queue.put(None)  # sentinel
+            log.info("⏱  LLM done: %.3fs | %r", time.perf_counter() - t_total, full_text[:80])
+
+        # ── Task B: send batched text to Sarvam WS ─────────────────────────
+        async def _send_to_ws():
+            buf = ""
+            try:
+                while True:
+                    token = await token_queue.get()
+                    if token is None:
+                        break
+                    buf += token
+                    # Flush on sentence boundary OR buffer length
+                    if _SENTENCE_END.search(buf) or len(buf) >= _SOFT_FLUSH_LEN:
+                        chunk_text = buf.strip()
+                        buf = ""
+                        if chunk_text:
+                            await self._ws.send(json.dumps({
+                                "type": "text",
+                                "data": {"text": chunk_text},
+                            }))
+                if buf.strip():
+                    await self._ws.send(json.dumps({
+                        "type": "text",
+                        "data": {"text": buf.strip()},
+                    }))
+                # Final flush tells Sarvam to send remaining audio + completion event
+                await self._ws.send(json.dumps({"type": "flush"}))
+                log.info("⏱  WS all text flushed: %.3fs", time.perf_counter() - t_total)
+            except Exception as e:
+                log.warning("_send_to_ws error: %s", e)
+                await audio_queue.put(e)  # signal error to receiver
+
+        # ── Task C (inline): receive audio chunks from Sarvam WS ───────────
+        ws_ok = await self._ensure_ws()
+
+        if ws_ok:
+            try:
+                llm_task  = asyncio.create_task(_drain_llm())
+                send_task = asyncio.create_task(_send_to_ws())
+                first_chunk = True
+
+                async for msg in self._ws:
+                    data     = json.loads(msg)
+                    msg_type = data.get("type")
+
+                    if msg_type == "audio":
+                        b64 = (data.get("data") or {}).get("audio") or ""
+                        if b64:
+                            chunk_bytes = base64.b64decode(b64)
+                            if first_chunk:
+                                log.info("⏱  First audio chunk: %.3fs",
+                                         time.perf_counter() - t_total)
+                                first_chunk = False
+                            yield chunk_bytes   # ← caller gets this immediately
+
+                    elif msg_type == "event":
+                        log.info("⏱  TTS stream complete: %.3fs",
+                                 time.perf_counter() - t_total)
+                        break
+
+                    elif msg_type == "error":
+                        raise RuntimeError(f"Sarvam WS error: {data}")
+
+                # Wait for LLM and send tasks to finish cleanly
+                await asyncio.gather(llm_task, send_task, return_exceptions=True)
+                return  # successfully streamed everything
+
+            except (ConnectionClosed, WebSocketException, OSError, RuntimeError) as e:
+                log.warning("WS stream chunk error: %s — REST fallback", e)
+                self._ws = None
+                self._config_sent = False
+                # Drain token_queue so _drain_llm doesn't hang
+                while not token_queue.empty():
+                    token_queue.get_nowait()
+
+        # ── REST fallback: collect full_text then synthesise once ───────────
+        log.info("Streaming REST fallback for: %r", full_text[:60])
+        # Drain remaining LLM tokens if WS path failed mid-stream
+        if not full_text:
+            try:
+                async for chunk in groq_stream:
+                    token = (chunk.choices[0].delta.content or "") if chunk.choices else ""
+                    full_text += token
+            except Exception:
+                pass
+
+        full_text = full_text.strip() or "Sorry, main samajh nahi payi."
+        try:
+            fname    = await generate_tts_async(full_text, self.language, self.speaker)
+            filepath = os.path.join(AUDIO_DIR, fname)
+            with open(filepath, "rb") as f:
+                data = f.read()
+            yield data   # yield the whole thing as one chunk
+        except Exception as e:
+            log.warning("REST TTS fallback also failed: %s", e)
+
     async def synthesise_to_bytes(self, text: str) -> bytes | None:
-        """
-        Returns audio bytes WITHOUT acquiring _lock.
-        FIX: empty/whitespace text returns None immediately — previously all
-        empty strings collided to cache key " " causing incorrect cache hits.
-        Checks cache first. On miss, uses REST (not WS) to avoid lock contention.
-        """
         cleaned = text.strip()
-        # FIX: never attempt to synthesise empty text
         if not cleaned:
             log.debug("synthesise_to_bytes: empty text — skipping")
             return None
@@ -308,7 +450,6 @@ class _PersistentWsConn:
             _tts_response_cache.move_to_end(cleaned)
             return _tts_response_cache[cleaned]
 
-        # Use REST directly — avoids WS _lock contention with keepalive/synthesis
         try:
             fname = await generate_tts_async(cleaned, self.language, self.speaker)
             path  = os.path.join(AUDIO_DIR, fname)
@@ -371,17 +512,34 @@ async def close_all_ws():
 # ── Public API ─────────────────────────────────────────────────────────────────
 
 async def llm_to_tts_stream(groq_stream, language=None, speaker=None) -> tuple[str, str]:
+    """Collect full stream then return filename. Non-streaming path."""
     if not SARVAM_API_KEY:
         raise ValueError("SARVAM_API_KEY not set")
     conn = await _get_conn(language or DEFAULT_LANGUAGE, speaker or DEFAULT_SPEAKER)
     return await conn.synthesise_stream(groq_stream)
 
 
+async def llm_to_tts_stream_chunks(groq_stream, language=None, speaker=None):
+    """
+    NEW PUBLIC API — async generator yielding MP3 chunks as they arrive.
+    Use this for the lowest possible latency path in media_stream.py.
+
+    Example:
+        async for mp3_chunk in llm_to_tts_stream_chunks(groq_stream):
+            mulaw = convert_to_mulaw(mp3_chunk)
+            await send_to_twilio(mulaw)
+    """
+    if not SARVAM_API_KEY:
+        raise ValueError("SARVAM_API_KEY not set")
+    conn = await _get_conn(language or DEFAULT_LANGUAGE, speaker or DEFAULT_SPEAKER)
+    async for chunk in conn.synthesise_stream_chunks(groq_stream):
+        yield chunk
+
+
 async def synthesise_text(text: str, language=None, speaker=None) -> str:
     if not SARVAM_API_KEY:
         raise ValueError("SARVAM_API_KEY not set")
 
-    # FIX: guard against empty text — was causing TTS("") → 500 on /call-user
     cleaned = (text or "").strip()
     if not cleaned:
         raise ValueError("synthesise_text called with empty string — check caller")
@@ -410,7 +568,6 @@ async def synthesise_text(text: str, language=None, speaker=None) -> str:
 
 
 async def synthesise_text_bytes(text: str, language=None, speaker=None) -> bytes | None:
-    """Cache-first bytes path. On miss uses REST (no WS lock contention)."""
     if not SARVAM_API_KEY:
         return None
     cleaned = (text or "").strip()
@@ -457,7 +614,6 @@ async def generate_tts_async(text: str, language=None, speaker=None, model=None)
     if not SARVAM_API_KEY:
         raise ValueError("SARVAM_API_KEY not set")
 
-    # FIX: guard against empty text at REST level too
     cleaned = (text or "").strip()
     if not cleaned:
         raise ValueError("generate_tts_async called with empty string")
@@ -476,7 +632,6 @@ async def generate_tts_async(text: str, language=None, speaker=None, model=None)
 
     t0 = time.perf_counter()
 
-    # FIX: retry on transient 5xx errors from Sarvam
     last_exc: Exception | None = None
     for attempt in range(3):
         try:
@@ -534,9 +689,5 @@ async def generate_tts_async(text: str, language=None, speaker=None, model=None)
 
 
 def generate_tts(text: str, language=None, speaker=None) -> str:
-    """
-    Sync wrapper — FOR CLI/SCRIPTS ONLY.
-    Do NOT call from within an async context (FastAPI handlers, etc.)
-    as asyncio.run() will raise RuntimeError if an event loop is already running.
-    """
+    """Sync wrapper — FOR CLI/SCRIPTS ONLY."""
     return asyncio.run(generate_tts_async(text, language, speaker))
